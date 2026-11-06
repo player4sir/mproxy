@@ -73,11 +73,22 @@ type trojanHandler struct {
 }
 
 func newTrojanHandler(lc ListenerConfig, out *Outbound, g *Guard, lim Limits, udpMgr *UDPManager) (*trojanHandler, error) {
-	cl, err := newCertLoader(lc.TLS.Cert, lc.TLS.Key)
-	if err != nil {
-		return nil, err
+	var tlsCfg *tls.Config
+	if lc.TLS != nil && lc.TLS.Cert != "" && lc.TLS.Key != "" {
+		cl, err := newCertLoader(lc.TLS.Cert, lc.TLS.Key)
+		if err != nil {
+			return nil, err
+		}
+		// 支持 h2 与 http/1.1 双 ALPN，抗针对 HTTP 协议版本的特征扫描
+		tlsCfg = &tls.Config{
+			GetCertificate: cl.get,
+			MinVersion:     tls.VersionTLS12,
+			NextProtos:     []string{"h2", "http/1.1"},
+		}
 	}
+
 	h := &trojanHandler{
+		tlsCfg:        tlsCfg,
 		hashes:        make(map[string]struct{}),
 		fallback:      lc.Fallback,
 		proxyProtocol: lc.FallbackProxyProtocol,
@@ -90,24 +101,23 @@ func newTrojanHandler(lc ListenerConfig, out *Outbound, g *Guard, lim Limits, ud
 		sum := sha256.Sum224([]byte(p))
 		h.hashes[hex.EncodeToString(sum[:])] = struct{}{}
 	}
-	// 支持 h2 与 http/1.1 双 ALPN，抗针对 HTTP 协议版本的特征扫描
-	h.tlsCfg = &tls.Config{
-		GetCertificate: cl.get,
-		MinVersion:     tls.VersionTLS12,
-		NextProtos:     []string{"h2", "http/1.1"},
-	}
 	return h, nil
 }
 
 func (h *trojanHandler) handle(ctx context.Context, raw net.Conn) {
 	ip := addrOf(raw)
 	_ = raw.SetDeadline(time.Now().Add(h.lim.HandshakeTimeout.Duration))
-	tc := tls.Server(raw, h.tlsCfg)
-	if err := tc.Handshake(); err != nil {
-		h.guard.Fail(ip) // 非 TLS 扫描器探测
-		return
+
+	var conn net.Conn = raw
+	if h.tlsCfg != nil {
+		tc := tls.Server(raw, h.tlsCfg)
+		if err := tc.Handshake(); err != nil {
+			h.guard.Fail(ip) // 非 TLS 扫描器探测
+			return
+		}
+		conn = tc
 	}
-	br := bufio.NewReaderSize(tc, 8192)
+	br := bufio.NewReaderSize(conn, 8192)
 
 	// Trojan 头部校验：56 字节 SHA-224 十六进制字符串 + CRLF
 	head, _ := br.Peek(56)
@@ -116,12 +126,12 @@ func (h *trojanHandler) handle(ctx context.Context, raw net.Conn) {
 	}
 	if len(head) != 56 {
 		h.guard.Fail(ip)
-		h.doFallback(ctx, raw, tc, br)
+		h.doFallback(ctx, raw, conn, br)
 		return
 	}
 	if _, ok := h.hashes[string(head)]; !ok {
 		h.guard.Fail(ip)
-		h.doFallback(ctx, raw, tc, br)
+		h.doFallback(ctx, raw, conn, br)
 		return
 	}
 	_, _ = br.Discard(56)
@@ -155,12 +165,12 @@ func (h *trojanHandler) handle(ctx context.Context, raw net.Conn) {
 			slog.Debug("trojan dial failed", "target", hostPort(host, port), "err", err)
 			return
 		}
-		_ = tc.SetDeadline(time.Time{})
-		relay(&bufConn{Conn: tc, r: br}, up, h.lim.IdleTimeout.Duration)
+		_ = conn.SetDeadline(time.Time{})
+		relay(&bufConn{Conn: conn, r: br}, up, h.lim.IdleTimeout.Duration)
 
 	case 0x03: // UDP ASSOCIATE (通过 TLS 流多路复用传输 Trojan UDP 帧)
-		_ = tc.SetDeadline(time.Time{})
-		h.handleTrojanUDP(ctx, tc, br)
+		_ = conn.SetDeadline(time.Time{})
+		h.handleTrojanUDP(ctx, conn, br)
 
 	default:
 		h.guard.Fail(ip)
@@ -172,6 +182,7 @@ func (h *trojanHandler) handle(ctx context.Context, raw net.Conn) {
 // 服务端回传帧格式: [ATYP + ADDR + PORT] [Length 2B] [\r\n] [Payload]
 func (h *trojanHandler) handleTrojanUDP(ctx context.Context, tc net.Conn, br *bufio.Reader) {
 	clientKey := fmt.Sprintf("trojan:%s", tc.RemoteAddr().String())
+	defer h.udpMgr.RemoveSession(clientKey)
 	var writeMu sync.Mutex
 
 	for {

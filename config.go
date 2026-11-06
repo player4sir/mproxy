@@ -25,6 +25,7 @@ func (d *Duration) UnmarshalJSON(b []byte) error {
 type Config struct {
 	LogLevel      string           `json:"log_level"`
 	MetricsListen string           `json:"metrics_listen"` // 监控指标监听地址（建议 127.0.0.1:9090）
+	SubToken      string           `json:"sub_token"`      // 订阅与监控接口访问安全令牌（可选）
 	Limits        Limits           `json:"limits"`
 	Outbound      OutboundConfig   `json:"outbound"`
 	Listeners     []ListenerConfig `json:"listeners"`
@@ -59,7 +60,7 @@ type TransportConfig struct {
 type ListenerConfig struct {
 	Type   string `json:"type"`   // vless | hysteria2 | trojan | shadowsocks | socks5 | http
 	Listen string `json:"listen"` // 监听地址，例如 "0.0.0.0:443" 或 "0.0.0.0:80"
-	UDP    bool   `json:"udp"`    // 是否开启 UDP 中继支持（默认开启）
+	UDP    *bool  `json:"udp"`    // 是否开启 UDP 中继支持（默认开启）
 
 	Transport             *TransportConfig  `json:"transport"`              // 传输层配置（tcp 或 ws CDN 中转）
 	TLS                   *TLSConfig        `json:"tls"`                    // TLS 证书配置
@@ -71,6 +72,13 @@ type ListenerConfig struct {
 	Method                string            `json:"method"`                 // shadowsocks 加密算法: aes-128-gcm | aes-256-gcm
 	Password              string            `json:"password"`               // shadowsocks / hysteria2 密码
 	Users                 map[string]string `json:"users"`                  // socks5 / http 用户名密码，或 vless 用户->UUID
+}
+
+func (l *ListenerConfig) IsUDP() bool {
+	if l.UDP == nil {
+		return true
+	}
+	return *l.UDP
 }
 
 func loadConfig(path string) (*Config, error) {
@@ -118,7 +126,10 @@ func setDefaults(c *Config) {
 		c.Outbound.DialTimeout.Duration = 8 * time.Second
 	}
 	for i := range c.Listeners {
-		c.Listeners[i].UDP = true
+		if c.Listeners[i].UDP == nil {
+			enable := true
+			c.Listeners[i].UDP = &enable
+		}
 	}
 }
 

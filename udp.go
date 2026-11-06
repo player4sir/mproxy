@@ -27,6 +27,8 @@ type UDPSession struct {
 	outConn    *net.UDPConn
 	lastActive atomic.Int64 // unix timestamp in seconds
 	cancel     context.CancelFunc
+	handlerMu  sync.RWMutex
+	handler    UDPResponseHandler
 }
 
 // UDPResponseHandler 将出站目标回包重新组装为特定协议格式（如 SOCKS5 / Trojan / Shadowsocks）并送回客户端
@@ -38,6 +40,8 @@ type UDPManager struct {
 	timeout    time.Duration
 	outbound   *Outbound
 	activeSess atomic.Int64
+	stop       chan struct{}
+	closed     atomic.Bool
 }
 
 func NewUDPManager(outbound *Outbound, timeout time.Duration) *UDPManager {
@@ -48,6 +52,7 @@ func NewUDPManager(outbound *Outbound, timeout time.Duration) *UDPManager {
 		sessions: make(map[string]*UDPSession),
 		timeout:  timeout,
 		outbound: outbound,
+		stop:     make(chan struct{}),
 	}
 	go m.reaperLoop()
 	return m
@@ -57,44 +62,46 @@ func NewUDPManager(outbound *Outbound, timeout time.Duration) *UDPManager {
 func (m *UDPManager) reaperLoop() {
 	ticker := time.NewTicker(15 * time.Second)
 	defer ticker.Stop()
-	for range ticker.C {
-		now := time.Now().Unix()
-		timeoutSec := int64(m.timeout.Seconds())
-		m.mu.Lock()
-		for key, sess := range m.sessions {
-			if now-sess.lastActive.Load() > timeoutSec {
-				sess.cancel()
-				_ = sess.outConn.Close()
-				delete(m.sessions, key)
-				m.activeSess.Add(-1)
+	for {
+		select {
+		case <-m.stop:
+			return
+		case <-ticker.C:
+			now := time.Now().Unix()
+			timeoutSec := int64(m.timeout.Seconds())
+			m.mu.Lock()
+			for key, sess := range m.sessions {
+				if now-sess.lastActive.Load() > timeoutSec {
+					sess.cancel()
+					_ = sess.outConn.Close()
+					delete(m.sessions, key)
+					m.activeSess.Add(-1)
+				}
 			}
+			m.mu.Unlock()
 		}
-		m.mu.Unlock()
 	}
+}
+
+// RemoveSession 手动释放特定客户端或流关联的 UDP 会话
+func (m *UDPManager) RemoveSession(clientKey string) {
+	m.mu.Lock()
+	if sess, ok := m.sessions[clientKey]; ok {
+		sess.cancel()
+		_ = sess.outConn.Close()
+		delete(m.sessions, clientKey)
+		m.activeSess.Add(-1)
+	}
+	m.mu.Unlock()
 }
 
 // SendPacket 转发客户端的一个 UDP 数据包到目标地址
 func (m *UDPManager) SendPacket(clientKey string, targetHost string, targetPort int, payload []byte, respHandler UDPResponseHandler) error {
-	// SSRF 防御校验
-	if m.outbound.blockPrivate {
-		ips, err := net.LookupIP(targetHost)
-		if err != nil {
-			return fmt.Errorf("udp resolve %s: %w", targetHost, err)
-		}
-		for _, ip := range ips {
-			if nip, err := netip.ParseAddr(ip.String()); err == nil {
-				nip = nip.Unmap()
-				if nip.IsLoopback() || nip.IsPrivate() || nip.IsLinkLocalUnicast() || nip.IsMulticast() {
-					return errors.New("udp destination blocked by ssrf policy")
-				}
-			}
-		}
-	}
-
-	dstAddr, err := net.ResolveUDPAddr("udp", hostPort(targetHost, targetPort))
+	ips, err := m.outbound.ResolveTarget(context.Background(), targetHost)
 	if err != nil {
-		return fmt.Errorf("resolve udp dst %s:%d: %w", targetHost, targetPort, err)
+		return fmt.Errorf("resolve udp dst %s: %w", targetHost, err)
 	}
+	dstAddr := &net.UDPAddr{IP: ips[0], Port: targetPort}
 
 	m.mu.RLock()
 	sess, ok := m.sessions[clientKey]
@@ -121,15 +128,22 @@ func (m *UDPManager) SendPacket(clientKey string, targetHost string, targetPort 
 				clientAddr: clientKey,
 				outConn:    outConn,
 				cancel:     cancel,
+				handler:    respHandler,
 			}
 			sess.lastActive.Store(time.Now().Unix())
 			m.sessions[clientKey] = sess
 			m.activeSess.Add(1)
 
 			// 启动该会话的回包监听 goroutine
-			go m.handleResponseLoop(ctx, sess, respHandler)
+			go m.handleResponseLoop(ctx, sess)
 		}
 		m.mu.Unlock()
+	}
+
+	if respHandler != nil {
+		sess.handlerMu.Lock()
+		sess.handler = respHandler
+		sess.handlerMu.Unlock()
 	}
 
 	sess.lastActive.Store(time.Now().Unix())
@@ -139,7 +153,7 @@ func (m *UDPManager) SendPacket(clientKey string, targetHost string, targetPort 
 	return err
 }
 
-func (m *UDPManager) handleResponseLoop(ctx context.Context, sess *UDPSession, respHandler UDPResponseHandler) {
+func (m *UDPManager) handleResponseLoop(ctx context.Context, sess *UDPSession) {
 	defer func() {
 		sess.cancel()
 		_ = sess.outConn.Close()
@@ -175,15 +189,25 @@ func (m *UDPManager) handleResponseLoop(ctx context.Context, sess *UDPSession, r
 			stats.BytesDown.Add(int64(n))
 			rHost := remoteAddr.IP.String()
 			rPort := remoteAddr.Port
-			if err := respHandler(rHost, rPort, buf[:n]); err != nil {
-				slog.Debug("udp response send failed", "client", sess.clientAddr, "err", err)
-				return
+
+			sess.handlerMu.RLock()
+			handler := sess.handler
+			sess.handlerMu.RUnlock()
+
+			if handler != nil {
+				if err := handler(rHost, rPort, buf[:n]); err != nil {
+					slog.Debug("udp response send failed", "client", sess.clientAddr, "err", err)
+					return
+				}
 			}
 		}
 	}
 }
 
 func (m *UDPManager) Close() {
+	if m.closed.CompareAndSwap(false, true) {
+		close(m.stop)
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	for _, sess := range m.sessions {

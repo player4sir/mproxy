@@ -3,9 +3,19 @@ package main
 import (
 	"bufio"
 	"context"
+	"crypto/ecdh"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/tls"
+	"crypto/x509"
+	"crypto/x509/pkix"
+	"encoding/base64"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"log/slog"
+	"math/big"
 	"net"
 	"strings"
 	"time"
@@ -15,7 +25,27 @@ import (
 type RealityConfig struct {
 	Dest        string   `json:"dest"`         // 真实伪装目标地址，例如 "www.microsoft.com:443" 或 "gateway.icloud.com:443"
 	ServerNames []string `json:"server_names"` // 允许的 SNI 列表
+	PrivateKey  string   `json:"private_key"`  // X25519 服务端私钥 (Base64URL)
+	PublicKey   string   `json:"public_key"`   // X25519 客户端连接公钥 (Base64URL)
 	ShortIDs    []string `json:"short_ids"`    // 客户端鉴权短 ID 列表（十六进制）
+}
+
+// GenerateX25519Keypair 使用标准库 crypto/ecdh 生成合法的 X25519 密钥对
+func GenerateX25519Keypair() (string, string, error) {
+	priv, err := ecdh.X25519().GenerateKey(rand.Reader)
+	if err != nil {
+		return "", "", fmt.Errorf("generate x25519: %w", err)
+	}
+	privStr := base64.RawURLEncoding.EncodeToString(priv.Bytes())
+	pubStr := base64.RawURLEncoding.EncodeToString(priv.PublicKey().Bytes())
+	return privStr, pubStr, nil
+}
+
+// GenerateShortID 生成 8 字节 (16 字符 hex) 随机鉴权 ShortID
+func GenerateShortID() string {
+	var b [8]byte
+	_, _ = rand.Read(b[:])
+	return hex.EncodeToString(b[:])
 }
 
 type realityHandler struct {
@@ -25,12 +55,76 @@ type realityHandler struct {
 	inner       Handler
 	guard       *Guard
 	lim         Limits
+	tlsCfg      *tls.Config
 }
 
-func newRealityHandler(cfg *RealityConfig, inner Handler, g *Guard, lim Limits) (*realityHandler, error) {
+func generateSelfSignedCert(names []string) (*tls.Certificate, error) {
+	priv, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		return nil, err
+	}
+	sn, _ := rand.Int(rand.Reader, big.NewInt(100000000))
+	cn := "www.microsoft.com"
+	if len(names) > 0 {
+		cn = names[0]
+	}
+	tpl := x509.Certificate{
+		SerialNumber: sn,
+		Subject:      pkix.Name{CommonName: cn},
+		NotBefore:    time.Now().Add(-24 * time.Hour),
+		NotAfter:     time.Now().Add(365 * 24 * time.Hour),
+		DNSNames:     names,
+		KeyUsage:     x509.KeyUsageKeyEncipherment | x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+	}
+	der, err := x509.CreateCertificate(rand.Reader, &tpl, &tpl, &priv.PublicKey, priv)
+	if err != nil {
+		return nil, err
+	}
+	cert := tls.Certificate{
+		Certificate: [][]byte{der},
+		PrivateKey:  priv,
+	}
+	return &cert, nil
+}
+
+func newRealityHandler(cfg *RealityConfig, inner Handler, g *Guard, lim Limits, customTLS *tls.Config) (*realityHandler, error) {
 	if cfg == nil || cfg.Dest == "" {
 		return nil, errors.New("reality requires dest (e.g. www.microsoft.com:443)")
 	}
+
+	// 自动补全或推导 X25519 密钥对
+	if cfg.PrivateKey == "" {
+		priv, pub, err := GenerateX25519Keypair()
+		if err == nil {
+			cfg.PrivateKey = priv
+			cfg.PublicKey = pub
+			slog.Info("auto-generated reality x25519 keypair", "pub", pub)
+		}
+	} else if cfg.PublicKey == "" {
+		if rawPriv, err := base64.RawURLEncoding.DecodeString(cfg.PrivateKey); err == nil {
+			if privKey, err := ecdh.X25519().NewPrivateKey(rawPriv); err == nil {
+				cfg.PublicKey = base64.RawURLEncoding.EncodeToString(privKey.PublicKey().Bytes())
+			}
+		}
+	}
+	if len(cfg.ShortIDs) == 0 {
+		cfg.ShortIDs = []string{GenerateShortID()}
+	}
+
+	tlsCfg := customTLS
+	if tlsCfg == nil {
+		cert, err := generateSelfSignedCert(cfg.ServerNames)
+		if err != nil {
+			return nil, fmt.Errorf("reality cert gen: %w", err)
+		}
+		tlsCfg = &tls.Config{
+			Certificates: []tls.Certificate{*cert},
+			MinVersion:   tls.VersionTLS12,
+			NextProtos:   []string{"h2", "http/1.1"},
+		}
+	}
+
 	h := &realityHandler{
 		dest:        cfg.Dest,
 		serverNames: make(map[string]struct{}),
@@ -38,6 +132,7 @@ func newRealityHandler(cfg *RealityConfig, inner Handler, g *Guard, lim Limits) 
 		inner:       inner,
 		guard:       g,
 		lim:         lim,
+		tlsCfg:      tlsCfg,
 	}
 	for _, sn := range cfg.ServerNames {
 		h.serverNames[strings.ToLower(sn)] = struct{}{}
@@ -189,10 +284,15 @@ func (h *realityHandler) handle(ctx context.Context, c net.Conn) {
 		return
 	}
 
-	// 鉴权通过：进入内层代理协议（VLESS / Trojan）
+	// 鉴权通过：完成 TLS 握手解密后进入内层代理协议（VLESS / Trojan）
 	_ = c.SetDeadline(time.Time{})
 	client := &bufConn{Conn: c, r: br}
-	h.inner(ctx, client)
+	tc := tls.Server(client, h.tlsCfg)
+	if err := tc.Handshake(); err != nil {
+		h.guard.Fail(ip)
+		return
+	}
+	h.inner(ctx, tc)
 }
 
 // fallbackToDest 将探测流量零篡改重定向给真实海外大站，完全伪装目标站行为

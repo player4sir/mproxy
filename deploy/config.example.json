@@ -24,6 +24,8 @@
       "reality": {
         "dest": "www.microsoft.com:443",
         "server_names": ["www.microsoft.com", "microsoft.com"],
+        "private_key": "",
+        "public_key": "",
         "short_ids": ["0123456789abcdef"]
       }
     },

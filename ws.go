@@ -107,10 +107,7 @@ func (c *wsConn) Read(p []byte) (int, error) {
 		}
 
 		switch opcode {
-		case 0x01, 0x02: // 文本帧 / 二进制帧
-			if !fin {
-				// 简易代理场景多为单帧传输
-			}
+		case 0x00, 0x01, 0x02: // 分片延续帧 / 文本帧 / 二进制帧
 			n := copy(p, payload)
 			c.readLeft = payload[n:]
 			return n, nil
@@ -119,6 +116,9 @@ func (c *wsConn) Read(p []byte) (int, error) {
 			return 0, io.EOF
 
 		case 0x09: // 心跳 Ping -> 响应 Pong (0x0A)
+			if len(payload) > 125 {
+				return 0, errors.New("ping payload exceeds 125 bytes")
+			}
 			c.wmu.Lock()
 			_ = c.writeControlFrame(0x0A, payload)
 			c.wmu.Unlock()
@@ -200,6 +200,28 @@ func UpgradeWebSocket(raw net.Conn, br *bufio.Reader, cfg *WSConfig) (net.Conn, 
 		if !strings.HasPrefix(reqPath, cfg.Path) {
 			_, _ = raw.Write([]byte("HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"))
 			return nil, fmt.Errorf("ws path mismatch: got %q, want prefix %q", reqPath, cfg.Path)
+		}
+	}
+
+	// 1.1 Host 校验（若配置）
+	if cfg != nil && cfg.Host != "" {
+		reqHost := req.Host
+		if h, _, err := net.SplitHostPort(reqHost); err == nil {
+			reqHost = h
+		}
+		if !strings.EqualFold(reqHost, cfg.Host) {
+			_, _ = raw.Write([]byte("HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"))
+			return nil, fmt.Errorf("ws host mismatch: got %q, want %q", req.Host, cfg.Host)
+		}
+	}
+
+	// 1.2 自定义 Headers 校验（若配置）
+	if cfg != nil && len(cfg.Headers) > 0 {
+		for k, v := range cfg.Headers {
+			if req.Header.Get(k) != v {
+				_, _ = raw.Write([]byte("HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"))
+				return nil, fmt.Errorf("ws header mismatch for %q", k)
+			}
 		}
 	}
 

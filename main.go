@@ -24,7 +24,19 @@ func main() {
 	check := flag.Bool("t", false, "test config syntax and exit")
 	sub := flag.Bool("sub", false, "generate client configs (sing-box, Clash.Meta, v2rayN) and exit")
 	host := flag.String("host", "", "public IP or domain name for client configs generation")
+	keygen := flag.Bool("keygen", false, "generate Reality X25519 keypair and short ID and exit")
 	flag.Parse()
+
+	if *keygen {
+		priv, pub, err := GenerateX25519Keypair()
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "keygen error:", err)
+			os.Exit(1)
+		}
+		sid, _ := GenerateShortID()
+		fmt.Printf("PrivateKey: %s\nPublicKey:  %s\nShortID:    %s\n", priv, pub, sid)
+		return
+	}
 
 	cfg, err := loadConfig(*cfgPath)
 	if err != nil {
@@ -65,8 +77,32 @@ func run(ctx context.Context, cfg *Config) error {
 		return fmt.Errorf("outbound init: %w", err)
 	}
 	guard := NewGuard(cfg.Limits)
+	defer guard.Close()
 	udpMgr := NewUDPManager(out, cfg.Limits.IdleTimeout.Duration)
 	defer udpMgr.Close()
+
+	// 启动内置反探测伪装站点（针对配置了本地 127.0.0.1 等本地回落地址的监听器）
+	startedFallbacks := make(map[string]bool)
+	for _, lc := range cfg.Listeners {
+		var addrs []string
+		if lc.Fallback != "" {
+			addrs = append(addrs, lc.Fallback)
+		}
+		if lc.Hy2 != nil && lc.Hy2.Masquerade != "" {
+			addrs = append(addrs, lc.Hy2.Masquerade)
+		}
+		for _, addr := range addrs {
+			h, _, err := net.SplitHostPort(addr)
+			if err == nil && (h == "127.0.0.1" || h == "localhost" || h == "::1") {
+				if !startedFallbacks[addr] {
+					startedFallbacks[addr] = true
+					if err := StartEmbeddedFallback(ctx, addr); err != nil {
+						slog.Warn("cannot start embedded fallback (maybe in use by external web server)", "addr", addr, "err", err)
+					}
+				}
+			}
+		}
+	}
 
 	var wg sync.WaitGroup
 	var servers []*Server
@@ -76,7 +112,7 @@ func run(ctx context.Context, cfg *Config) error {
 	for _, lc := range cfg.Listeners {
 		// Hysteria 2 基于 QUIC/UDP，独立处理监听器初始化
 		if lc.Type == "hysteria2" || lc.Type == "hy2" {
-			hy2Ln, err := StartHy2Listener(ctx, lc, out, guard, cfg.Limits, udpMgr)
+			hy2Ln, err := StartHy2Listener(ctx, lc, out, guard, cfg.Limits, udpMgr, &wg)
 			if err != nil {
 				return fmt.Errorf("hy2 %s: %w", lc.Listen, err)
 			}
@@ -84,18 +120,18 @@ func run(ctx context.Context, cfg *Config) error {
 			continue
 		}
 
-		var h Handler
+		var coreHandler Handler
 		switch lc.Type {
 		case "socks5":
-			h = (&socks5Handler{users: lc.Users, out: out, guard: guard, lim: cfg.Limits, udpMgr: udpMgr}).handle
+			coreHandler = (&socks5Handler{users: lc.Users, out: out, guard: guard, lim: cfg.Limits, udpMgr: udpMgr}).handle
 
 		case "http":
-			h = (&httpHandler{users: lc.Users, out: out, guard: guard, lim: cfg.Limits}).handle
+			coreHandler = (&httpHandler{users: lc.Users, out: out, guard: guard, lim: cfg.Limits}).handle
 
 		case "shadowsocks":
 			sh := newSSHandler(lc, out, guard, cfg.Limits, udpMgr)
-			h = sh.handle
-			if lc.UDP {
+			coreHandler = sh.handle
+			if lc.IsUDP() {
 				uAddr, err := net.ResolveUDPAddr("udp", lc.Listen)
 				if err != nil {
 					return fmt.Errorf("resolve ss udp %s: %w", lc.Listen, err)
@@ -110,60 +146,30 @@ func run(ctx context.Context, cfg *Config) error {
 			}
 
 		case "trojan":
-			th, err := newTrojanHandler(lc, out, guard, cfg.Limits, udpMgr)
+			// 当 Trojan 挂载在 WebSocket 传输层后时，TLS 终止由外层负责，避免内层重复 Handshake
+			trojanLC := lc
+			if lc.Transport != nil && lc.Transport.Type == "ws" {
+				trojanLC.TLS = nil
+			}
+			th, err := newTrojanHandler(trojanLC, out, guard, cfg.Limits, udpMgr)
 			if err != nil {
 				return fmt.Errorf("trojan %s: %w", lc.Listen, err)
 			}
-			h = th.handle
-			if lc.Reality != nil {
-				rh, err := newRealityHandler(lc.Reality, h, guard, cfg.Limits)
-				if err != nil {
-					return fmt.Errorf("trojan reality %s: %w", lc.Listen, err)
-				}
-				h = rh.handle
-			}
+			coreHandler = th.handle
 
 		case "vless":
 			vh, err := newVLESSHandler(lc, out, guard, cfg.Limits, udpMgr)
 			if err != nil {
 				return fmt.Errorf("vless %s: %w", lc.Listen, err)
 			}
-			innerHandler := vh.handle
-
-			if lc.Reality != nil {
-				rh, err := newRealityHandler(lc.Reality, innerHandler, guard, cfg.Limits)
-				if err != nil {
-					return fmt.Errorf("vless reality %s: %w", lc.Listen, err)
-				}
-				h = rh.handle
-			} else if lc.TLS != nil {
-				cl, err := newCertLoader(lc.TLS.Cert, lc.TLS.Key)
-				if err != nil {
-					return fmt.Errorf("vless tls %s: %w", lc.Listen, err)
-				}
-				tlsCfg := &tls.Config{
-					GetCertificate: cl.get,
-					MinVersion:     tls.VersionTLS12,
-					NextProtos:     []string{"h2", "http/1.1"},
-				}
-				h = func(ctx context.Context, c net.Conn) {
-					tc := tls.Server(c, tlsCfg)
-					if err := tc.Handshake(); err != nil {
-						guard.Fail(addrOf(c))
-						return
-					}
-					innerHandler(ctx, tc)
-				}
-			} else {
-				h = innerHandler
-			}
+			coreHandler = vh.handle
 		}
 
-		// 如果配置了 WebSocket 传输层（例如 Cloudflare CDN 代理中转）
+		// 传输层中介包装：如果配置了 WebSocket（例如 Cloudflare CDN 代理中转）
 		if lc.Transport != nil && lc.Transport.Type == "ws" {
-			upstreamHandler := h
+			upstreamHandler := coreHandler
 			wsCfg := lc.Transport.WS
-			h = func(ctx context.Context, c net.Conn) {
+			coreHandler = func(ctx context.Context, c net.Conn) {
 				br := bufio.NewReaderSize(c, 8192)
 				wsConn, err := UpgradeWebSocket(c, br, wsCfg)
 				if err != nil {
@@ -172,6 +178,44 @@ func run(ctx context.Context, cfg *Config) error {
 				}
 				upstreamHandler(ctx, wsConn)
 			}
+		}
+
+		// 传输层外层包装：Reality 或标准 TLS (WSS / VLESS TLS)
+		var h Handler
+		if lc.Reality != nil {
+			var tlsCfg *tls.Config
+			if lc.TLS != nil {
+				cl, err := newCertLoader(lc.TLS.Cert, lc.TLS.Key)
+				if err == nil {
+					tlsCfg = &tls.Config{GetCertificate: cl.get, MinVersion: tls.VersionTLS12, NextProtos: []string{"h2", "http/1.1"}}
+				}
+			}
+			rh, err := newRealityHandler(lc.Reality, coreHandler, guard, cfg.Limits, tlsCfg)
+			if err != nil {
+				return fmt.Errorf("%s reality %s: %w", lc.Type, lc.Listen, err)
+			}
+			h = rh.handle
+		} else if lc.TLS != nil && (lc.Type == "vless" || (lc.Transport != nil && lc.Transport.Type == "ws")) {
+			cl, err := newCertLoader(lc.TLS.Cert, lc.TLS.Key)
+			if err != nil {
+				return fmt.Errorf("%s tls %s: %w", lc.Type, lc.Listen, err)
+			}
+			tlsCfg := &tls.Config{
+				GetCertificate: cl.get,
+				MinVersion:     tls.VersionTLS12,
+				NextProtos:     []string{"h2", "http/1.1"},
+			}
+			inner := coreHandler
+			h = func(ctx context.Context, c net.Conn) {
+				tc := tls.Server(c, tlsCfg)
+				if err := tc.Handshake(); err != nil {
+					guard.Fail(addrOf(c))
+					return
+				}
+				inner(ctx, tc)
+			}
+		} else {
+			h = coreHandler
 		}
 
 		lcfg := net.ListenConfig{KeepAlive: 30 * time.Second}
@@ -205,6 +249,16 @@ func run(ctx context.Context, cfg *Config) error {
 			})
 		})
 		mux.HandleFunc("/sub", func(w http.ResponseWriter, r *http.Request) {
+			if cfg.SubToken != "" {
+				token := r.URL.Query().Get("token")
+				if token == "" {
+					token = r.Header.Get("X-Sub-Token")
+				}
+				if token != cfg.SubToken {
+					http.Error(w, "Unauthorized: invalid sub token", http.StatusUnauthorized)
+					return
+				}
+			}
 			pubHost := r.URL.Query().Get("host")
 			if pubHost == "" {
 				pubHost = r.Host

@@ -39,6 +39,7 @@ type Guard struct {
 	mu    sync.Mutex
 	conns map[netip.Addr]int
 	fails map[netip.Addr]*failRec
+	stop  chan struct{}
 }
 
 func NewGuard(l Limits) *Guard {
@@ -47,23 +48,37 @@ func NewGuard(l Limits) *Guard {
 		sem:   make(chan struct{}, l.MaxConns),
 		conns: make(map[netip.Addr]int),
 		fails: make(map[netip.Addr]*failRec),
+		stop:  make(chan struct{}),
 	}
 	// 定期清理过期封禁记录
 	go func() {
 		ticker := time.NewTicker(time.Minute)
 		defer ticker.Stop()
-		for range ticker.C {
-			g.mu.Lock()
-			now := time.Now()
-			for ip, f := range g.fails {
-				if now.After(f.until) && now.Sub(f.last) > 15*time.Minute {
-					delete(g.fails, ip)
+		for {
+			select {
+			case <-g.stop:
+				return
+			case <-ticker.C:
+				g.mu.Lock()
+				now := time.Now()
+				for ip, f := range g.fails {
+					if now.After(f.until) && now.Sub(f.last) > 15*time.Minute {
+						delete(g.fails, ip)
+					}
 				}
+				g.mu.Unlock()
 			}
-			g.mu.Unlock()
 		}
 	}()
 	return g
+}
+
+func (g *Guard) Close() {
+	select {
+	case <-g.stop:
+	default:
+		close(g.stop)
+	}
 }
 
 func addrOf(c net.Conn) netip.Addr {
@@ -193,6 +208,56 @@ func NewOutbound(c OutboundConfig) (*Outbound, error) {
 	return o, nil
 }
 
+func isBlockedIP(ip net.IP) bool {
+	if nip, err := netip.ParseAddr(ip.String()); err == nil {
+		nip = nip.Unmap()
+		return nip.IsLoopback() || nip.IsPrivate() || nip.IsLinkLocalUnicast() ||
+			nip.IsLinkLocalMulticast() || nip.IsMulticast() || nip.IsUnspecified() ||
+			nip.IsInterfaceLocalMulticast()
+	}
+	return true
+}
+
+func (o *Outbound) ResolveTarget(ctx context.Context, host string) ([]net.IP, error) {
+	if ip := net.ParseIP(host); ip != nil {
+		if o.blockPrivate && isBlockedIP(ip) {
+			return nil, errors.New("destination blocked by ssrf policy")
+		}
+		return []net.IP{ip}, nil
+	}
+
+	o.dnsMu.RLock()
+	e, ok := o.dnsCache[host]
+	o.dnsMu.RUnlock()
+	if ok && time.Now().Before(e.expiresAt) {
+		return e.ips, nil
+	}
+
+	ips, err := net.DefaultResolver.LookupIP(ctx, "ip", host)
+	if err != nil {
+		return nil, err
+	}
+
+	var valid []net.IP
+	for _, ip := range ips {
+		if o.blockPrivate && isBlockedIP(ip) {
+			continue
+		}
+		valid = append(valid, ip)
+	}
+	if len(valid) == 0 {
+		return nil, errors.New("destination blocked by ssrf policy")
+	}
+
+	o.dnsMu.Lock()
+	o.dnsCache[host] = dnsEntry{
+		ips:       valid,
+		expiresAt: time.Now().Add(2 * time.Minute),
+	}
+	o.dnsMu.Unlock()
+	return valid, nil
+}
+
 func (o *Outbound) Dial(ctx context.Context, host string, port int) (net.Conn, error) {
 	return o.d.DialContext(ctx, "tcp", hostPort(host, port))
 }
@@ -279,6 +344,21 @@ func relay(a, b net.Conn, idle time.Duration) {
 				ctr.Add(int64(len(head)))
 				_, _ = bc.r.Discard(len(head))
 			}
+		}
+
+		rawSrc, r := unwrapTCPConn(src)
+		rawDst, _ := unwrapTCPConn(dst)
+		// 零拷贝通道：当双方均为底层 TCP 套接字且已无预读残留时，触发 Linux splice(2) 直接内核管道转发
+		if rawSrc != nil && rawDst != nil && (r == nil || r.Buffered() == 0) {
+			_ = rawSrc.SetReadDeadline(time.Time{})
+			_ = rawDst.SetWriteDeadline(time.Time{})
+			n, copyErr := io.Copy(rawDst, rawSrc)
+			ctr.Add(n)
+			if copyErr == nil {
+				closeWrite(dst)
+			}
+			done <- copyErr
+			return
 		}
 
 		bp := bufPool.Get().(*[]byte)

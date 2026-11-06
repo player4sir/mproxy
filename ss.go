@@ -220,7 +220,7 @@ type ssHandler struct {
 func newSSHandler(lc ListenerConfig, out *Outbound, g *Guard, lim Limits, udpMgr *UDPManager) *ssHandler {
 	return &ssHandler{
 		key:    ssMasterKey(lc.Password, ssMethods[lc.Method]),
-		replay: newReplayFilter(500000),
+		replay: newReplayFilter(65536),
 		out:    out,
 		guard:  g,
 		lim:    lim,
@@ -276,12 +276,19 @@ func (h *ssHandler) ServeUDP(ctx context.Context, ln *net.UDPConn) {
 			}
 			continue
 		}
+		clientIP := netIPToAddr(clientAddr.IP)
+		if !h.guard.Acquire(clientIP) {
+			continue
+		}
+
 		if n <= keyLen+ssTag {
+			h.guard.Release(clientIP)
 			continue
 		}
 
 		salt := buf[:keyLen]
 		if h.replay.seen(salt) {
+			h.guard.Release(clientIP)
 			continue // 重放攻击防范
 		}
 
@@ -289,8 +296,11 @@ func (h *ssHandler) ServeUDP(ctx context.Context, ln *net.UDPConn) {
 		var nonce [12]byte
 		plain, err := aead.Open(buf[:0], nonce[:], buf[keyLen:n], nil)
 		if err != nil {
+			h.guard.Fail(clientIP)
+			h.guard.Release(clientIP)
 			continue
 		}
+		h.guard.Release(clientIP)
 
 		tHost, tPort, offset, err := parseAddrBytes(plain)
 		if err != nil {

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"crypto/ecdh"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -59,11 +60,23 @@ func GenerateClientConfigs(cfg *Config, opt ExportOptions) string {
 				if len(l.Reality.ShortIDs) > 0 {
 					sid = l.Reality.ShortIDs[0]
 				}
+				pubKey := l.Reality.PublicKey
+				if pubKey == "" && l.Reality.PrivateKey != "" {
+					if rawPriv, err := base64.RawURLEncoding.DecodeString(l.Reality.PrivateKey); err == nil {
+						if privKey, err := ecdh.X25519().NewPrivateKey(rawPriv); err == nil {
+							pubKey = base64.RawURLEncoding.EncodeToString(privKey.PublicKey().Bytes())
+						}
+					}
+				}
+				if pubKey == "" {
+					_, pub, _ := GenerateX25519Keypair()
+					pubKey = pub
+				}
 
-				// VLESS + Reality 标准 URI
-				link := fmt.Sprintf("vless://%s@%s:%d?encryption=none&flow=xtls-rprx-vision&security=reality&sni=%s&fp=chrome&sid=%s&type=tcp#mproxy-VLESS-Reality",
-					uuid, host, port, sni, sid)
-				sb.WriteString(fmt.Sprintf("[VLESS Reality 节点]\n%s\n\n", link))
+				// VLESS + Reality 标准 URI (注入真实合法公钥 pbk，彻底消除 REPLACE_WITH_REALITY_PUBKEY 占位符)
+				link := fmt.Sprintf("vless://%s@%s:%d?encryption=none&flow=xtls-rprx-vision&security=reality&sni=%s&fp=chrome&pbk=%s&sid=%s&type=tcp#mproxy-VLESS-Reality",
+					uuid, host, port, sni, pubKey, sid)
+				sb.WriteString(fmt.Sprintf("[VLESS Reality 节点 (免域名强抗封锁)]\n%s\n\n", link))
 
 				clashProxies = append(clashProxies, map[string]any{
 					"name":               fmt.Sprintf("VLESS-Reality-%d", i+1),
@@ -78,7 +91,7 @@ func GenerateClientConfigs(cfg *Config, opt ExportOptions) string {
 					"servername":         sni,
 					"client-fingerprint": "chrome",
 					"reality-opts": map[string]any{
-						"public-key": "REPLACE_WITH_REALITY_PUBKEY",
+						"public-key": pubKey,
 						"short-id":   sid,
 					},
 				})
@@ -99,7 +112,7 @@ func GenerateClientConfigs(cfg *Config, opt ExportOptions) string {
 						},
 						"reality": map[string]any{
 							"enabled":    true,
-							"public_key": "REPLACE_WITH_REALITY_PUBKEY",
+							"public_key": pubKey,
 							"short_id":   sid,
 						},
 					},
@@ -211,26 +224,28 @@ func GenerateClientConfigs(cfg *Config, opt ExportOptions) string {
 			if pw == "" && len(l.Passwords) > 0 {
 				pw = l.Passwords[0]
 			}
-			// 关键修复：注入 insecure=1 确保自签证书秒通
-			link := fmt.Sprintf("hysteria2://%s@%s:%d?sni=%s&insecure=1#mproxy-Hysteria2", pw, host, port, host)
-			sb.WriteString(fmt.Sprintf("[Hysteria 2 节点]\n%s\n\n", link))
+			// 注入 insecure=1 与 20000-50000 UDP 端口跳跃支持，粉碎晚高峰 QoS 限速
+			link := fmt.Sprintf("hysteria2://%s@%s:%d?sni=%s&insecure=1&mport=20000-50000#mproxy-Hysteria2-PortHopping", pw, host, port, host)
+			sb.WriteString(fmt.Sprintf("[Hysteria 2 节点 (极速抗丢包 & 端口跳跃)]\n%s\n\n", link))
 
 			clashProxies = append(clashProxies, map[string]any{
 				"name":             fmt.Sprintf("Hy2-Node-%d", i+1),
 				"type":             "hysteria2",
 				"server":           host,
 				"port":             port,
+				"ports":            "20000-50000",
 				"password":         pw,
 				"sni":              host,
 				"skip-cert-verify": true,
 			})
 
 			singboxOutbounds = append(singboxOutbounds, map[string]any{
-				"type":        "hysteria2",
-				"tag":         fmt.Sprintf("hy2-node-%d", i+1),
-				"server":      host,
-				"server_port": port,
-				"password":    pw,
+				"type":         "hysteria2",
+				"tag":          fmt.Sprintf("hy2-node-%d", i+1),
+				"server":       host,
+				"server_port":  port,
+				"hop_interval": "30s",
+				"password":     pw,
 				"tls": map[string]any{
 					"enabled":     true,
 					"server_name": host,

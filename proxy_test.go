@@ -20,6 +20,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -367,5 +368,206 @@ func TestWebSocketUpgrade(t *testing.T) {
 	_, _ = io.ReadFull(br, respPayload)
 	if len(respPayload) < 2 || respPayload[0] != 0 || respPayload[1] != 0 {
 		t.Fatalf("vless over ws resp error: %v", respPayload)
+	}
+}
+
+func TestConfigUDPDisable(t *testing.T) {
+	disable := false
+	cfg := &Config{
+		Listeners: []ListenerConfig{
+			{Type: "vless", Listen: "127.0.0.1:443", UDP: &disable},
+			{Type: "shadowsocks", Listen: "127.0.0.1:8388"},
+		},
+	}
+	setDefaults(cfg)
+
+	if cfg.Listeners[0].IsUDP() != false {
+		t.Fatal("expected listeners[0].IsUDP() to be false, got true")
+	}
+	if cfg.Listeners[1].IsUDP() != true {
+		t.Fatal("expected listeners[1].IsUDP() to be true (default)")
+	}
+}
+
+func TestWSSLayered(t *testing.T) {
+	echoTCP := startEchoTCP(t)
+	lim := testLimits()
+	out := newOut(t)
+	certFile, keyFile := selfSigned(t)
+
+	testUUID := "a5e18239-6523-446f-b258-2e06180632a7"
+	vh, _ := newVLESSHandler(ListenerConfig{Passwords: []string{testUUID}}, out, NewGuard(lim), lim, nil)
+
+	wsCfg := &WSConfig{Path: "/wss-path"}
+	cl, _ := newCertLoader(certFile, keyFile)
+	tlsCfg := &tls.Config{
+		GetCertificate: cl.get,
+		NextProtos:     []string{"http/1.1"},
+	}
+
+	// 模拟 main.go 的标准洋葱模型：TLS -> WS -> VLESS
+	coreHandler := func(ctx context.Context, c net.Conn) {
+		br := bufio.NewReaderSize(c, 8192)
+		wsC, err := UpgradeWebSocket(c, br, wsCfg)
+		if err != nil {
+			return
+		}
+		vh.handle(ctx, wsC)
+	}
+
+	handler := func(ctx context.Context, c net.Conn) {
+		tc := tls.Server(c, tlsCfg)
+		if err := tc.Handshake(); err != nil {
+			return
+		}
+		coreHandler(ctx, tc)
+	}
+
+	srv := startServer(t, handler, lim)
+
+	// 客户端：Dial TLS -> 发起 WS 升级 -> 发送 VLESS 数据包
+	tlsClient, err := tls.Dial("tcp", srv, &tls.Config{InsecureSkipVerify: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tlsClient.Close()
+
+	req := "GET /wss-path HTTP/1.1\r\n" +
+		"Host: example.com\r\n" +
+		"Upgrade: websocket\r\n" +
+		"Connection: Upgrade\r\n" +
+		"Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n" +
+		"Sec-WebSocket-Version: 13\r\n\r\n"
+	_, _ = tlsClient.Write([]byte(req))
+
+	br := bufio.NewReader(tlsClient)
+	resp, err := http.ReadResponse(br, nil)
+	if err != nil || resp.StatusCode != 101 {
+		t.Fatalf("wss upgrade failed: %v, status=%d", err, resp.StatusCode)
+	}
+
+	uBytes, _ := parseUUID(testUUID)
+	h, p, _ := net.SplitHostPort(echoTCP)
+	var pn int
+	for _, ch := range p {
+		pn = pn*10 + int(ch-'0')
+	}
+	var portB [2]byte
+	binary.BigEndian.PutUint16(portB[:], uint16(pn))
+
+	vlessReq := []byte{0x00}
+	vlessReq = append(vlessReq, uBytes[:]...)
+	vlessReq = append(vlessReq, 0x00, 0x01)
+	vlessReq = append(vlessReq, portB[:]...)
+	vlessReq = append(vlessReq, 0x01)
+	vlessReq = append(vlessReq, net.ParseIP(h).To4()...)
+
+	mask := [4]byte{0x12, 0x34, 0x56, 0x78}
+	maskedPayload := make([]byte, len(vlessReq))
+	for i := range vlessReq {
+		maskedPayload[i] = vlessReq[i] ^ mask[i%4]
+	}
+	frameHdr := []byte{0x82, 0x80 | byte(len(vlessReq))}
+	frameHdr = append(frameHdr, mask[:]...)
+	_, _ = tlsClient.Write(append(frameHdr, maskedPayload...))
+
+	var wsHdr [2]byte
+	_, _ = io.ReadFull(br, wsHdr[:])
+	if wsHdr[0] != 0x82 {
+		t.Fatalf("expected binary frame 0x82, got 0x%02x", wsHdr[0])
+	}
+	plen := int(wsHdr[1] & 0x7F)
+	respPayload := make([]byte, plen)
+	_, _ = io.ReadFull(br, respPayload)
+	if len(respPayload) < 2 || respPayload[0] != 0 || respPayload[1] != 0 {
+		t.Fatalf("vless over wss resp error: %v", respPayload)
+	}
+}
+
+func TestRealityFallback(t *testing.T) {
+	echoTCP := startEchoTCP(t)
+	lim := testLimits()
+	guard := NewGuard(lim)
+
+	rh, err := newRealityHandler(&RealityConfig{
+		Dest:     echoTCP,
+		ShortIDs: []string{"abcd"},
+	}, func(ctx context.Context, c net.Conn) {
+		t.Fatal("should not reach inner handler for probe traffic")
+	}, guard, lim, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	srv := startServer(t, rh.handle, lim)
+
+	c, err := net.Dial("tcp", srv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+
+	// 模拟非合规探测流量（普通 HTTP 请求或未带 ShortID 的 ClientHello）
+	_, _ = c.Write([]byte("GET /probe HTTP/1.1\r\nHost: test\r\n\r\n"))
+	buf := make([]byte, 128)
+	n, err := c.Read(buf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(buf[:n]), "GET /probe") {
+		t.Fatalf("expected fallback echo to return probe data, got: %q", buf[:n])
+	}
+}
+
+func TestX25519Keygen(t *testing.T) {
+	priv, pub, err := GenerateX25519Keypair()
+	if err != nil {
+		t.Fatalf("GenerateX25519Keypair err: %v", err)
+	}
+	if len(priv) < 40 || len(pub) < 40 {
+		t.Fatalf("unexpected key length: priv=%s, pub=%s", priv, pub)
+	}
+	sid := GenerateShortID()
+	if len(sid) != 16 {
+		t.Fatalf("unexpected shortID length: %s", sid)
+	}
+}
+
+func TestEmbeddedFallback(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	addr := "127.0.0.1:0"
+	ln, err := net.Listen("tcp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	actualAddr := ln.Addr().String()
+	_ = ln.Close()
+
+	if err := StartEmbeddedFallback(ctx, actualAddr); err != nil {
+		t.Fatalf("StartEmbeddedFallback err: %v", err)
+	}
+
+	time.Sleep(100 * time.Millisecond)
+
+	c, err := net.Dial("tcp", actualAddr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+
+	// 模拟带 PROXY protocol v1 的请求
+	req := "PROXY TCP4 1.2.3.4 5.6.7.8 12345 80\r\nGET / HTTP/1.1\r\nHost: test.com\r\nConnection: close\r\n\r\n"
+	if _, err := c.Write([]byte(req)); err != nil {
+		t.Fatal(err)
+	}
+
+	resp, err := io.ReadAll(c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(resp), "200 OK") || !strings.Contains(string(resp), "Edge Node Gateway") {
+		t.Fatalf("unexpected fallback response: %s", string(resp))
 	}
 }

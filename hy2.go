@@ -59,7 +59,7 @@ func newHy2Handler(lc ListenerConfig, out *Outbound, g *Guard, lim Limits, udpMg
 }
 
 // StartHy2Listener 启动 Hysteria 2 服务端监听
-func StartHy2Listener(ctx context.Context, lc ListenerConfig, out *Outbound, g *Guard, lim Limits, udpMgr *UDPManager) (*quic.Listener, error) {
+func StartHy2Listener(ctx context.Context, lc ListenerConfig, out *Outbound, g *Guard, lim Limits, udpMgr *UDPManager, wg *sync.WaitGroup) (*quic.Listener, error) {
 	cl, err := newCertLoader(lc.TLS.Cert, lc.TLS.Key)
 	if err != nil {
 		return nil, fmt.Errorf("hy2 cert load: %w", err)
@@ -80,8 +80,10 @@ func StartHy2Listener(ctx context.Context, lc ListenerConfig, out *Outbound, g *
 		EnableDatagrams:                true,
 		MaxIdleTimeout:                 lim.IdleTimeout.Duration,
 		KeepAlivePeriod:                15 * time.Second,
-		InitialStreamReceiveWindow:     2 * 1024 * 1024,
-		InitialConnectionReceiveWindow: 8 * 1024 * 1024,
+		InitialStreamReceiveWindow:     8 * 1024 * 1024,
+		InitialConnectionReceiveWindow: 32 * 1024 * 1024,
+		MaxStreamReceiveWindow:         16 * 1024 * 1024,
+		MaxConnectionReceiveWindow:     64 * 1024 * 1024,
 		Allow0RTT:                      true,
 	}
 
@@ -115,6 +117,9 @@ func StartHy2Listener(ctx context.Context, lc ListenerConfig, out *Outbound, g *
 			}
 			stats.Active.Add(1)
 			stats.Total.Add(1)
+			if wg != nil {
+				wg.Add(1)
+			}
 
 			go func() {
 				defer func() {
@@ -123,6 +128,9 @@ func StartHy2Listener(ctx context.Context, lc ListenerConfig, out *Outbound, g *
 					}
 					stats.Active.Add(-1)
 					g.Release(ip)
+					if wg != nil {
+						wg.Done()
+					}
 				}()
 				h.handleSession(ctx, sess)
 			}()
@@ -174,8 +182,10 @@ func (h *hy2Handler) handleSession(ctx context.Context, sess quic.Connection) {
 	reqData := peekBuf[:n]
 	authenticated := false
 
-	// 匹配密码或 /auth 特征
-	if len(h.password) == 0 || bytes.Contains(reqData, []byte(h.password)) || bytes.Contains(reqData, []byte("auth")) {
+	// 修复高危鉴权绕过漏洞：严禁仅因包含 "auth" 字符串就放行认证！
+	if len(h.password) == 0 {
+		authenticated = true
+	} else if bytes.Contains(reqData, []byte(h.password)) {
 		authenticated = true
 	}
 
@@ -187,13 +197,27 @@ func (h *hy2Handler) handleSession(ctx context.Context, sess quic.Connection) {
 		return
 	}
 
-	// 官方 Hysteria 2 认证成功规范：服务端发送 HTTP/3 状态码 233 HyOK
+	// 官方 Hysteria 2 认证成功规范：服务端发送符合 RFC 9114 / RFC 9204 规范的标准 HTTP/3 响应帧
+	// 包含 :status: 233, hysteria-udp: true, hysteria-cc-rx: auto
 	hy2OKResp := []byte{
-		0x01,                               // Frame Type: HEADERS
-		0x09,                               // Payload Length
-		0x00, 0x00,                         // Required Insert Count & Base
-		0x5f, 0x10, 0x83, 0x49, 0x7e, 0xab, // QPACK 压缩响应状态码 233
-		0x00,                               // 结束位
+		0x01,       // HTTP/3 Frame Type: HEADERS
+		0x2f,       // Payload 长度 (47 字节)
+		0x00, 0x00, // QPACK Prefix: Required Insert Count = 0, Base = 0
+
+		// Header 1: :status = 233 (T=1, Static Table Index 24 for :status, H=0, Len=3)
+		0x58, 0x03, '2', '3', '3',
+
+		// Header 2: hysteria-udp = true (Literal without Name Reference: 0x20, NameLen=12, ValLen=4)
+		0x20, 0x0c,
+		'h', 'y', 's', 't', 'e', 'r', 'i', 'a', '-', 'u', 'd', 'p',
+		0x04,
+		't', 'r', 'u', 'e',
+
+		// Header 3: hysteria-cc-rx = auto (Literal without Name Reference: 0x20, NameLen=14, ValLen=4)
+		0x20, 0x0e,
+		'h', 'y', 's', 't', 'e', 'r', 'i', 'a', '-', 'c', 'c', '-', 'r', 'x',
+		0x04,
+		'a', 'u', 't', 'o',
 	}
 	_, _ = authStream.Write(hy2OKResp)
 	authStream.Close()
@@ -219,8 +243,10 @@ func (h *hy2Handler) handleTCPStream(ctx context.Context, sess quic.Connection, 
 	reqID, err := quicvarint.Read(quicvarint.NewReader(stream))
 	var targetHost string
 	var targetPort int
+	isHy2Req := false
 
 	if err == nil && reqID == 0x401 {
+		isHy2Req = true
 		// 标准 Hysteria 2 协议流: [0x401] [addr_len] [addr_str] [padding_len] [padding]
 		addrLen, err := quicvarint.Read(quicvarint.NewReader(stream))
 		if err != nil || addrLen == 0 || addrLen > 512 {
@@ -245,9 +271,6 @@ func (h *hy2Handler) handleTCPStream(ctx context.Context, sess quic.Connection, 
 			targetHost = addrStr
 			targetPort = 80
 		}
-
-		// 发送 Hysteria 2 官方 TCPResponse (0x00 OK)
-		_, _ = stream.Write([]byte{0x00, 0x00, 0x00})
 	} else {
 		// 兼容兜底：SOCKS5 地址流解析
 		targetHost, targetPort, err = readAddr(stream)
@@ -261,9 +284,19 @@ func (h *hy2Handler) handleTCPStream(ctx context.Context, sess quic.Connection, 
 	cancel()
 	if err != nil {
 		slog.Debug("hy2 tcp dial failed", "target", hostPort(targetHost, targetPort), "err", err)
+		if isHy2Req {
+			_, _ = stream.Write([]byte{0x01, 0x00, 0x00})
+		}
 		return
 	}
 	defer up.Close()
+
+	if isHy2Req {
+		// 仅在出站拨号成功后才发送 Hysteria 2 官方 TCPResponse (0x00 OK)
+		if _, err := stream.Write([]byte{0x00, 0x00, 0x00}); err != nil {
+			return
+		}
+	}
 
 	streamConn := &quicStreamConn{Stream: stream, sess: sess}
 	relay(streamConn, up, h.lim.IdleTimeout.Duration)
@@ -271,33 +304,55 @@ func (h *hy2Handler) handleTCPStream(ctx context.Context, sess quic.Connection, 
 
 // handleDatagrams 处理基于 RFC 9221 QUIC Datagram 的 UDP 中继
 func (h *hy2Handler) handleDatagrams(ctx context.Context, sess quic.Connection) {
-	clientKey := fmt.Sprintf("hy2:%s", sess.RemoteAddr().String())
-
 	for {
 		msg, err := sess.ReceiveDatagram(ctx)
 		if err != nil {
 			return
 		}
-		// Hysteria 2 UDP 报文格式解析
-		if len(msg) < 8 {
+		if len(msg) < 5 {
 			continue
 		}
-		sessID := binary.BigEndian.Uint32(msg[:4])
-		host, port, offset, err := parseAddrBytes(msg[4:])
+
+		var sessID uint32
+		var addrBytes []byte
+		var isFragmented bool
+		var fragHeader []byte
+
+		// 检查是否包含分片包头: [PacketID 2B] [FragID 1B] [FragCount 1B] [SessionID 4B]
+		if len(msg) >= 12 && (msg[8] == 1 || msg[8] == 3 || msg[8] == 4) {
+			isFragmented = true
+			fragHeader = msg[:8]
+			sessID = binary.BigEndian.Uint32(msg[4:8])
+			addrBytes = msg[8:]
+		} else if len(msg) >= 8 {
+			// 标准非分片包头: [SessionID 4B] [Addr] [Payload]
+			sessID = binary.BigEndian.Uint32(msg[:4])
+			addrBytes = msg[4:]
+		} else {
+			continue
+		}
+
+		host, port, offset, err := parseAddrBytes(addrBytes)
 		if err != nil {
 			continue
 		}
-		payload := msg[4+offset:]
+		payload := addrBytes[offset:]
 
+		clientKey := fmt.Sprintf("hy2:%s:%d", sess.RemoteAddr().String(), sessID)
 		_ = h.udpMgr.SendPacket(clientKey, host, port, payload, func(respHost string, respPort int, respPayload []byte) error {
 			respAddr, err := writeAddr(nil, respHost, respPort)
 			if err != nil {
 				return err
 			}
-			var hdr [4]byte
-			binary.BigEndian.PutUint32(hdr[:], sessID)
-
-			packet := append(hdr[:], respAddr...)
+			var packet []byte
+			if isFragmented {
+				packet = append(packet, fragHeader...)
+			} else {
+				var hdr [4]byte
+				binary.BigEndian.PutUint32(hdr[:], sessID)
+				packet = append(packet, hdr[:]...)
+			}
+			packet = append(packet, respAddr...)
 			packet = append(packet, respPayload...)
 			return sess.SendDatagram(packet)
 		})

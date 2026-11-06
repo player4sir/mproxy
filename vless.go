@@ -80,9 +80,13 @@ func newVLESSHandler(lc ListenerConfig, out *Outbound, g *Guard, lim Limits, udp
 	// 兼容 passwords 列表形式作为 UUID
 	for _, idStr := range lc.Passwords {
 		u, err := parseUUID(idStr)
-		if err == nil {
-			h.uuids[u] = idStr
+		if err != nil {
+			return nil, fmt.Errorf("password %q is not a valid uuid: %w", idStr, err)
 		}
+		h.uuids[u] = idStr
+	}
+	if len(h.uuids) == 0 {
+		return nil, errors.New("vless requires at least one valid uuid")
 	}
 	return h, nil
 }
@@ -217,6 +221,7 @@ func (h *vlessHandler) handle(ctx context.Context, c net.Conn) {
 // handleVLESSUDP 在 VLESS 连接上中继 UDP 数据流（每帧格式: [Len 2B] [Payload]）
 func (h *vlessHandler) handleVLESSUDP(ctx context.Context, c net.Conn, br *bufio.Reader, initHost string, initPort int) {
 	clientKey := fmt.Sprintf("vless:%s", c.RemoteAddr().String())
+	defer h.udpMgr.RemoveSession(clientKey)
 	var writeMu sync.Mutex
 
 	for {

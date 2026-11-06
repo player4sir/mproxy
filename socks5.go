@@ -108,7 +108,16 @@ func (h *socks5Handler) handleUDPAssociate(ctx context.Context, c net.Conn) {
 	assignedPort := udpLn.LocalAddr().(*net.UDPAddr).Port
 	bindIP := localTCPAddr.IP.String()
 	if localTCPAddr.IP.IsUnspecified() {
-		bindIP = "127.0.0.1"
+		if remoteTCP, ok := c.RemoteAddr().(*net.TCPAddr); ok {
+			if probeConn, err := net.DialUDP("udp", nil, &net.UDPAddr{IP: remoteTCP.IP, Port: 1}); err == nil {
+				bindIP = probeConn.LocalAddr().(*net.UDPAddr).IP.String()
+				probeConn.Close()
+			} else {
+				bindIP = "127.0.0.1"
+			}
+		} else {
+			bindIP = "127.0.0.1"
+		}
 	}
 	replySocks5(c, 0x00, bindIP, assignedPort)
 	_ = c.SetDeadline(time.Time{})
@@ -116,11 +125,22 @@ func (h *socks5Handler) handleUDPAssociate(ctx context.Context, c net.Conn) {
 	var clientUDPAddr *net.UDPAddr
 	var clientMu sync.RWMutex
 
+	defer func() {
+		clientMu.RLock()
+		target := clientUDPAddr
+		clientMu.RUnlock()
+		if target != nil {
+			h.udpMgr.RemoveSession(fmt.Sprintf("socks5:%s", target.String()))
+		}
+	}()
+
 	// 启动 UDP 读包循环
 	go func() {
 		bp := udpBufPool.Get().(*[]byte)
 		defer udpBufPool.Put(bp)
 		buf := *bp
+
+		remoteTCP, _ := c.RemoteAddr().(*net.TCPAddr)
 
 		for {
 			_ = udpLn.SetReadDeadline(time.Now().Add(h.lim.IdleTimeout.Duration))
@@ -129,6 +149,10 @@ func (h *socks5Handler) handleUDPAssociate(ctx context.Context, c net.Conn) {
 				return
 			}
 			if n < 4 {
+				continue
+			}
+			// 校验 UDP 源 IP 是否与建立 TCP 控制连接的客户端一致，防止未授权劫持
+			if remoteTCP != nil && !rAddr.IP.Equal(remoteTCP.IP) {
 				continue
 			}
 			// 校验 SOCKS5 UDP 头: RSV(2B)=0, FRAG(1B)=0

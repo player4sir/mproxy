@@ -122,6 +122,15 @@ if [[ ! -f /etc/mproxy/config.json ]]; then
     SS_PW=$(openssl rand -base64 16 | tr -dc 'a-zA-Z0-9' | head -c 16)
     SOCKS_PW=$(openssl rand -base64 12 | tr -dc 'a-zA-Z0-9' | head -c 12)
 
+    # 生成 Reality X25519 密钥对与 short_id
+    KEYGEN_OUT=$(/usr/local/bin/mproxy-core -keygen 2>/dev/null || true)
+    REALITY_PRIV=$(echo "$KEYGEN_OUT" | awk '/PrivateKey:/ {print $2}')
+    REALITY_PUB=$(echo "$KEYGEN_OUT" | awk '/PublicKey:/ {print $2}')
+    REALITY_SID=$(echo "$KEYGEN_OUT" | awk '/ShortID:/ {print $2}')
+    if [[ -z "$REALITY_SID" ]]; then
+        REALITY_SID=$(openssl rand -hex 8)
+    fi
+
     cat > /etc/mproxy/config.json << EOF
 {
   "log_level": "info",
@@ -146,9 +155,12 @@ if [[ ! -f /etc/mproxy/config.json ]]; then
       "listen": "0.0.0.0:443",
       "udp": true,
       "passwords": ["${VLESS_UUID}"],
-      "tls": {
-        "cert": "/etc/mproxy/cert.pem",
-        "key": "/etc/mproxy/key.pem"
+      "reality": {
+        "dest": "www.microsoft.com:443",
+        "server_names": ["www.microsoft.com", "microsoft.com"],
+        "private_key": "${REALITY_PRIV}",
+        "public_key": "${REALITY_PUB}",
+        "short_ids": ["${REALITY_SID}"]
       }
     },
     {
@@ -229,6 +241,32 @@ net.ipv4.tcp_rmem = 4096 131072 16777216
 net.ipv4.tcp_wmem = 4096 131072 16777216
 EOF
 sysctl --system >/dev/null 2>&1 || true
+
+# 配置 UDP Port Hopping (针对 Hysteria 2 UDP 端口跳跃抗 QoS)
+if command -v iptables >/dev/null 2>&1; then
+    iptables -t nat -C PREROUTING -p udp --dport 20000:50000 -j REDIRECT --to-ports 8443 2>/dev/null || \
+    iptables -t nat -A PREROUTING -p udp --dport 20000:50000 -j REDIRECT --to-ports 8443 2>/dev/null || true
+fi
+
+# 自动放行防火墙端口 (443, 8443 UDP, 20000-50000 UDP 等)
+if command -v ufw >/dev/null 2>&1 && ufw status | grep -q "Status: active"; then
+    ufw allow 443/tcp >/dev/null 2>&1 || true
+    ufw allow 8443/udp >/dev/null 2>&1 || true
+    ufw allow 20000:50000/udp >/dev/null 2>&1 || true
+    ufw allow 8080/tcp >/dev/null 2>&1 || true
+    ufw allow 9443/tcp >/dev/null 2>&1 || true
+    ufw allow 8388/tcp >/dev/null 2>&1 || true
+    ufw allow 8388/udp >/dev/null 2>&1 || true
+elif command -v firewall-cmd >/dev/null 2>&1 && systemctl is-active --quiet firewalld; then
+    firewall-cmd --permanent --add-port=443/tcp >/dev/null 2>&1 || true
+    firewall-cmd --permanent --add-port=8443/udp >/dev/null 2>&1 || true
+    firewall-cmd --permanent --add-port=20000-50000/udp >/dev/null 2>&1 || true
+    firewall-cmd --permanent --add-port=8080/tcp >/dev/null 2>&1 || true
+    firewall-cmd --permanent --add-port=9443/tcp >/dev/null 2>&1 || true
+    firewall-cmd --permanent --add-port=8388/tcp >/dev/null 2>&1 || true
+    firewall-cmd --permanent --add-port=8388/udp >/dev/null 2>&1 || true
+    firewall-cmd --reload >/dev/null 2>&1 || true
+fi
 
 # 7. 配置 systemd 服务自启并启动
 echo -e "${GREEN}[6/7]${PLAIN} 配置 systemd 系统服务..."

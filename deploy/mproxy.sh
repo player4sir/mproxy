@@ -204,6 +204,37 @@ EOF
     echo -e "${GREEN}[成功] BBR 拥塞控制及网络调优参数已生效！当前算法: $(get_bbr_status)${PLAIN}"
 }
 
+# 生成 Reality X25519 密钥对
+generate_keys() {
+    echo -e "${CYAN}正在生成全新 Reality X25519 密钥对与 short_id...${PLAIN}\n"
+    "$BIN_CORE" -keygen
+    echo -e "\n${YELLOW}提示：您可以将上述密钥与 shortID 填入 /etc/mproxy/config.json 的 reality 配置节中。${PLAIN}"
+}
+
+# UDP 端口跳跃管理 (Hysteria 2 Port Hopping)
+manage_port_hop() {
+    check_root
+    echo -e "${CYAN}--- UDP 端口跳跃转发规则管理 (20000:50000 -> 8443) ---${PLAIN}"
+    if iptables -t nat -C PREROUTING -p udp --dport 20000:50000 -j REDIRECT --to-ports 8443 2>/dev/null; then
+        echo -e "当前状态: ${GREEN}已生效 (Active)${PLAIN}"
+        echo -e "${YELLOW}是否需要移除该规则？[y/N]: ${PLAIN}\c"
+        read -r choice
+        if [[ "$choice" =~ ^[Yy]$ ]]; then
+            iptables -t nat -D PREROUTING -p udp --dport 20000:50000 -j REDIRECT --to-ports 8443 2>/dev/null || true
+            echo -e "${GREEN}[成功] 已移除 UDP 端口跳跃规则。${PLAIN}"
+        fi
+    else
+        echo -e "当前状态: ${RED}未生效 (Inactive)${PLAIN}"
+        echo -e "${YELLOW}是否立即添加并开启端口跳跃？[Y/n]: ${PLAIN}\c"
+        read -r choice
+        choice=${choice:-Y}
+        if [[ "$choice" =~ ^[Yy]$ ]]; then
+            iptables -t nat -A PREROUTING -p udp --dport 20000:50000 -j REDIRECT --to-ports 8443 2>/dev/null || true
+            echo -e "${GREEN}[成功] 已成功开启 UDP 20000:50000 -> 8443 端口跳跃！${PLAIN}"
+        fi
+    fi
+}
+
 # 卸载 mproxy
 uninstall_mproxy() {
     check_root
@@ -260,6 +291,14 @@ case "$1" in
         edit_config
         exit 0
         ;;
+    hop|port-hop)
+        manage_port_hop
+        exit 0
+        ;;
+    keygen|key)
+        generate_keys
+        exit 0
+        ;;
     bbr)
         enable_bbr
         exit 0
@@ -282,31 +321,35 @@ show_menu() {
     echo -e "----------------------------------------------------------"
     echo -e " ${GREEN}1.${PLAIN} 查看客户端节点链接与订阅配置 (sing-box/Clash/v2rayN)"
     echo -e " ${GREEN}2.${PLAIN} 一键申请并配置正规域名权威证书 (Let's Encrypt)"
+    echo -e " ${GREEN}3.${PLAIN} 管理 UDP 端口跳跃规则 (Port Hopping 20000-50000)"
+    echo -e " ${GREEN}4.${PLAIN} 生成 Reality X25519 密钥对与 ShortID"
     echo -e "----------------------------------------------------------"
-    echo -e " ${GREEN}3.${PLAIN} 启动 mproxy"
-    echo -e " ${GREEN}4.${PLAIN} 停止 mproxy"
-    echo -e " ${GREEN}5.${PLAIN} 重启 mproxy"
+    echo -e " ${GREEN}5.${PLAIN} 启动 mproxy"
+    echo -e " ${GREEN}6.${PLAIN} 停止 mproxy"
+    echo -e " ${GREEN}7.${PLAIN} 重启 mproxy"
     echo -e "----------------------------------------------------------"
-    echo -e " ${GREEN}6.${PLAIN} 查看实时运行日志"
-    echo -e " ${GREEN}7.${PLAIN} 修改服务端配置文件 (config.json)"
-    echo -e " ${GREEN}8.${PLAIN} 一键开启与优化 BBR 内核加速"
-    echo -e " ${RED}9.${PLAIN} 彻底卸载 mproxy"
+    echo -e " ${GREEN}8.${PLAIN} 查看实时运行日志"
+    echo -e " ${GREEN}9.${PLAIN} 修改服务端配置文件 (config.json)"
+    echo -e " ${GREEN}10.${PLAIN} 一键开启与优化 BBR 内核加速"
+    echo -e " ${RED}11.${PLAIN} 彻底卸载 mproxy"
     echo -e "----------------------------------------------------------"
     echo -e " ${CYAN}0.${PLAIN} 退出管理面板"
     echo -e "=========================================================="
-    echo -e "请输入选项 [0-9]: \c"
+    echo -e "请输入选项 [0-11]: \c"
     read -r num
 
     case "$num" in
         1) view_sub ;;
         2) apply_cert ;;
-        3) start_service ;;
-        4) stop_service ;;
-        5) restart_service ;;
-        6) view_log ;;
-        7) edit_config ;;
-        8) enable_bbr ;;
-        9) uninstall_mproxy ;;
+        3) manage_port_hop ;;
+        4) generate_keys ;;
+        5) start_service ;;
+        6) stop_service ;;
+        7) restart_service ;;
+        8) view_log ;;
+        9) edit_config ;;
+        10) enable_bbr ;;
+        11) uninstall_mproxy ;;
         0) exit 0 ;;
         *) echo -e "${RED}[错误] 无效选项！${PLAIN}" ;;
     esac
