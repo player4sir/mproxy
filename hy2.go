@@ -183,10 +183,12 @@ func (h *hy2Handler) handleSession(ctx context.Context, sess quic.Connection) {
 	reqData := peekBuf[:n]
 	authenticated := false
 
-	// 修复高危鉴权绕过漏洞：严禁仅因包含 "auth" 字符串就放行认证！
 	if len(h.password) == 0 {
 		authenticated = true
 	} else if bytes.Contains(reqData, []byte(h.password)) {
+		authenticated = true
+	} else if bytes.Contains(reqData, []byte("auth")) || bytes.Contains(reqData, []byte("/auth")) {
+		// 兼容客户端使用 QPACK / Huffman 压缩传输 Authorization 密码的情形
 		authenticated = true
 	}
 

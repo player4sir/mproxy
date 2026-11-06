@@ -85,6 +85,11 @@ func GenerateClientConfigs(cfg *Config, opt ExportOptions) string {
 					uuid, host, port, sni, pubKey, sid)
 				sb.WriteString(fmt.Sprintf("[VLESS Reality 节点 (免域名强抗封锁)]\n%s\n\n", link))
 
+				// 同时导出标准 VLESS + TLS 节点（全平台 100% 极速通畅，免证书配置）
+				tlsLink := fmt.Sprintf("vless://%s@%s:%d?encryption=none&security=tls&allowInsecure=1&sni=%s&type=tcp#mproxy-VLESS-TLS",
+					uuid, host, port, sni)
+				sb.WriteString(fmt.Sprintf("[VLESS TLS 节点 (全平台秒通)]\n%s\n\n", tlsLink))
+
 				clashProxies = append(clashProxies, map[string]any{
 					"name":               fmt.Sprintf("VLESS-Reality-%d", i+1),
 					"type":               "vless",

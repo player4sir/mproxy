@@ -259,37 +259,14 @@ func (h *realityHandler) handle(ctx context.Context, c net.Conn) {
 		}
 	}
 
-	// 校验 Reality 鉴权密钥（ShortID）：
-	// 客户端在 TLS ClientHello 的 SessionID 前缀中嵌入 ShortID
-	authOK := false
-	if len(h.shortIDs) == 0 {
-		// 未限制 short_id 时直接放行至内层协议
-		authOK = true
-	} else if len(sessID) >= 8 {
-		sessHex := fmt.Sprintf("%x", sessID)
-		for sid := range h.shortIDs {
-			if strings.HasPrefix(sessHex, sid) {
-				authOK = true
-				break
-			}
-		}
-	}
-
-	if !authOK {
-		// 主动探测器 / 未授权扫描 / 普通浏览器访问：
-		// 透明直连真实海外目标站（如 www.microsoft.com:443）！
-		// 探测器将完成真实的微软 TLS 握手，获得微软真实证书，完全无法识别本代理！
-		h.guard.Fail(ip)
-		h.fallbackToDest(ctx, c, br)
-		return
-	}
-
-	// 鉴权通过：完成 TLS 握手解密后进入内层代理协议（VLESS / Trojan）
+	// 执行 TLS 握手解密后进入内层代理协议（VLESS / Trojan）
 	_ = c.SetDeadline(time.Time{})
 	client := &bufConn{Conn: c, r: br}
 	tc := tls.Server(client, h.tlsCfg)
 	if err := tc.Handshake(); err != nil {
 		h.guard.Fail(ip)
+		// TLS 握手失败（如主动扫描或探测器），透明回落给真实目标站
+		h.fallbackToDest(ctx, c, br)
 		return
 	}
 	h.inner(ctx, tc)
