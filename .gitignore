@@ -1,6 +1,5 @@
 # Binaries
 /mproxy
-dist/
 
 # TLS Keys & Certs
 *.pem

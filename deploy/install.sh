@@ -2,7 +2,7 @@
 # ====================================================================
 # mproxy 全自动一键部署与初始化脚本
 # 支持本地执行与 GitHub 远程一键安装:
-# bash <(curl -fsSL https://raw.githubusercontent.com/<USER>/mproxy/main/deploy/install.sh)
+# bash <(curl -fsSL https://raw.githubusercontent.com/player4sir/mproxy/main/deploy/install.sh)
 # ====================================================================
 
 set -e
@@ -13,7 +13,7 @@ YELLOW='\033[0;33m'
 CYAN='\033[0;36m'
 PLAIN='\033[0m'
 
-GITHUB_REPO="${GITHUB_REPO:-""}" # 用户可指定如 "username/mproxy"
+GITHUB_REPO="${GITHUB_REPO:-"player4sir/mproxy"}"
 
 echo -e "=========================================================="
 echo -e "         ${CYAN}mproxy 现代多协议代理 全自动一键部署${PLAIN}"
@@ -41,76 +41,72 @@ case "$ARCH" in
 esac
 echo -e "${GREEN}[1/7]${PLAIN} 检测到 CPU 架构: ${CYAN}${BIN_ARCH}${PLAIN}"
 
-# 3. 安装依赖工具 (curl, openssl, tar, git)
+# 3. 安装依赖工具 (curl, openssl, tar)
 echo -e "${GREEN}[2/7]${PLAIN} 检查并安装基础依赖工具..."
 if command -v apt-get >/dev/null 2>&1; then
-    apt-get update -y >/dev/null 2>&1
-    apt-get install -y curl openssl tar systemd git >/dev/null 2>&1
+    apt-get update -y >/dev/null 2>&1 || true
+    apt-get install -y curl openssl tar systemd >/dev/null 2>&1 || true
 elif command -v dnf >/dev/null 2>&1; then
-    dnf install -y curl openssl tar systemd git >/dev/null 2>&1
+    dnf install -y curl openssl tar systemd >/dev/null 2>&1 || true
 elif command -v yum >/dev/null 2>&1; then
-    yum install -y curl openssl tar systemd git >/dev/null 2>&1
+    yum install -y curl openssl tar systemd >/dev/null 2>&1 || true
 fi
 
 # 4. 定位与安装核心二进制
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd || echo "")"
 PROJECT_ROOT="$(dirname "$SCRIPT_DIR" 2>/dev/null || echo "")"
 
-# 如果是通过 curl 远程管道运行，且当前目录无源码，从 GitHub 拉取
-if [[ ! -f "$PROJECT_ROOT/dist/mproxy-linux-${BIN_ARCH}" && ! -f "$PROJECT_ROOT/main.go" ]]; then
-    TMP_DIR="/tmp/mproxy_install_$(date +%s)"
-    mkdir -p "$TMP_DIR"
-    echo -e "${CYAN}检测到远程在线安装模式，正在准备部署环境...${PLAIN}"
+echo -e "${GREEN}[3/7]${PLAIN} 部署 mproxy 核心二进制..."
+
+# 方案 A: 检查本地预编译文件
+if [[ -f "$PROJECT_ROOT/dist/mproxy-linux-${BIN_ARCH}" ]]; then
+    cp "$PROJECT_ROOT/dist/mproxy-linux-${BIN_ARCH}" /usr/local/bin/mproxy-core
+    chmod +x /usr/local/bin/mproxy-core
+elif [[ -f "$PROJECT_ROOT/mproxy" ]]; then
+    cp "$PROJECT_ROOT/mproxy" /usr/local/bin/mproxy-core
+    chmod +x /usr/local/bin/mproxy-core
+fi
+
+# 方案 B: 远程从 GitHub 仓库下载预编译程序
+if [[ ! -f /usr/local/bin/mproxy-core || ! -s /usr/local/bin/mproxy-core ]]; then
+    echo -e "${CYAN}正在从 GitHub (${GITHUB_REPO}) 获取预编译程序...${PLAIN}"
+    RAW_BIN_URL="https://raw.githubusercontent.com/${GITHUB_REPO}/main/dist/mproxy-linux-${BIN_ARCH}"
+    RELEASE_BIN_URL="https://github.com/${GITHUB_REPO}/releases/latest/download/mproxy-linux-${BIN_ARCH}"
     
-    # 尝试从 GitHub Releases 下载预编译二进制，若无则 clone
-    if [[ -n "$GITHUB_REPO" ]]; then
-        RELEASE_URL="https://github.com/${GITHUB_REPO}/releases/latest/download/mproxy-linux-${BIN_ARCH}"
-        echo -e "${CYAN}正在从 GitHub Releases 下载核心程序...${PLAIN}"
-        if curl -fsSL -o /usr/local/bin/mproxy-core "$RELEASE_URL" 2>/dev/null; then
-            chmod +x /usr/local/bin/mproxy-core
-        fi
-    fi
-    
-    # 获取管理脚本
-    if [[ ! -f /usr/local/bin/mproxy-core ]]; then
-        if command -v git >/dev/null 2>&1 && [[ -n "$GITHUB_REPO" ]]; then
-            git clone --depth=1 "https://github.com/${GITHUB_REPO}.git" "$TMP_DIR"
-            PROJECT_ROOT="$TMP_DIR"
-            SCRIPT_DIR="$PROJECT_ROOT/deploy"
-        fi
+    if curl -fsSL -o /usr/local/bin/mproxy-core "$RAW_BIN_URL" 2>/dev/null; then
+        chmod +x /usr/local/bin/mproxy-core
+    elif curl -fsSL -o /usr/local/bin/mproxy-core "$RELEASE_BIN_URL" 2>/dev/null; then
+        chmod +x /usr/local/bin/mproxy-core
     fi
 fi
 
-echo -e "${GREEN}[3/7]${PLAIN} 部署 mproxy 核心二进制..."
-if [[ -f "$PROJECT_ROOT/dist/mproxy-linux-${BIN_ARCH}" ]]; then
-    cp "$PROJECT_ROOT/dist/mproxy-linux-${BIN_ARCH}" /usr/local/bin/mproxy-core
-elif [[ -f "$PROJECT_ROOT/mproxy" ]]; then
-    cp "$PROJECT_ROOT/mproxy" /usr/local/bin/mproxy-core
-elif [[ -f /usr/local/bin/mproxy-core ]]; then
-    : # 已通过 release 下载完成
-else
-    # 本地编译尝试
+# 方案 C: 若二进制下载失败且本地有 Go 环境，执行即时编译
+if [[ ! -f /usr/local/bin/mproxy-core || ! -s /usr/local/bin/mproxy-core ]]; then
     if command -v go >/dev/null 2>&1 && [[ -f "$PROJECT_ROOT/main.go" ]]; then
-        echo -e "${CYAN}检测到 Go 环境，正在编译源码...${PLAIN}"
+        echo -e "${CYAN}正在通过本地 Go 环境编译...${PLAIN}"
         (cd "$PROJECT_ROOT" && go build -trimpath -ldflags="-s -w" -o /usr/local/bin/mproxy-core .)
-    else
-        echo -e "${RED}[错误]${PLAIN} 未找到可执行文件，请确保项目已编译或配置 GITHUB_REPO 环境变量！"
-        exit 1
+        chmod +x /usr/local/bin/mproxy-core
     fi
 fi
-chmod +x /usr/local/bin/mproxy-core
+
+# 校验核心二进制是否就绪
+if [[ ! -f /usr/local/bin/mproxy-core || ! -x /usr/local/bin/mproxy-core ]]; then
+    echo -e "${RED}[错误]${PLAIN} 无法获取 mproxy-core 可执行文件！"
+    echo -e "请确认 GitHub 仓库 ${CYAN}https://github.com/${GITHUB_REPO}${PLAIN} 中已推送 dist/mproxy-linux-${BIN_ARCH}"
+    exit 1
+fi
 
 # 安装 CLI 快捷管理工具
 if [[ -f "$SCRIPT_DIR/mproxy.sh" ]]; then
     cp "$SCRIPT_DIR/mproxy.sh" /usr/local/bin/mproxy
     chmod +x /usr/local/bin/mproxy
-elif [[ -n "$GITHUB_REPO" ]]; then
-    curl -fsSL "https://raw.githubusercontent.com/${GITHUB_REPO}/main/deploy/mproxy.sh" -o /usr/local/bin/mproxy
+else
+    curl -fsSL "https://raw.githubusercontent.com/${GITHUB_REPO}/main/deploy/mproxy.sh" -o /usr/local/bin/mproxy 2>/dev/null || true
     chmod +x /usr/local/bin/mproxy
 fi
 
-# 5. 生成生产环境配置与安全密钥
-echo -e "${GREEN}[4/7]${PLAIN} 初始化配置与随机安全凭证..."
+# 5. 生成生产环境配置与安全凭证
+echo -e "${GREEN}[4/7]${PLAIN} 初始化配置与安全凭据..."
 mkdir -p /etc/mproxy
 
 # 生成默认自签 TLS 证书
@@ -222,11 +218,7 @@ fi
 
 # 6. 配置网络内核调优 (BBR & TCP Fast Open)
 echo -e "${GREEN}[5/7]${PLAIN} 开启 BBR 拥塞控制算法与网络内核优化..."
-if [[ -f "$SCRIPT_DIR/99-mproxy.conf" ]]; then
-    cp "$SCRIPT_DIR/99-mproxy.conf" /etc/sysctl.d/99-mproxy.conf
-    sysctl --system >/dev/null 2>&1 || true
-else
-    cat > /etc/sysctl.d/99-mproxy.conf << 'EOF'
+cat > /etc/sysctl.d/99-mproxy.conf << 'EOF'
 net.core.default_qdisc = fq
 net.ipv4.tcp_congestion_control = bbr
 net.core.somaxconn = 8192
@@ -241,8 +233,7 @@ net.core.wmem_max = 16777216
 net.ipv4.tcp_rmem = 4096 131072 16777216
 net.ipv4.tcp_wmem = 4096 131072 16777216
 EOF
-    sysctl --system >/dev/null 2>&1 || true
-fi
+sysctl --system >/dev/null 2>&1 || true
 
 # 7. 配置 systemd 服务自启并启动
 echo -e "${GREEN}[6/7]${PLAIN} 配置 systemd 系统服务..."
@@ -272,7 +263,7 @@ systemctl enable mproxy >/dev/null 2>&1
 systemctl restart mproxy
 
 # 8. 验证服务启动状态
-echo -e "${GREEN}[7/7]${PLAIN} 验证服务状态..."
+echo -e "${GREEN}[7/7]${PLAIN} 验证服务运行状态..."
 sleep 1
 if systemctl is-active --quiet mproxy; then
     echo -e "\n${GREEN}==========================================================${PLAIN}"
