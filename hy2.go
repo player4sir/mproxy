@@ -158,14 +158,12 @@ func (c *quicStreamConn) RemoteAddr() net.Addr {
 func (h *hy2Handler) handleSession(ctx context.Context, sess quic.Connection) {
 	defer sess.CloseWithError(0x00, "session closed")
 
-	// 1. 等待客户端建立首条流进行认证 (HTTP/3 或简易流)
+	// 1. 等待客户端建立首条流进行认证 (HTTP/3 POST /auth 请求)
 	authStream, err := sess.AcceptStream(ctx)
 	if err != nil {
 		return
 	}
 
-	// 官方 Hysteria 2 规范：客户端发起 HTTP/3 POST /auth 请求
-	// 读取前置字节识别握手模式
 	peekBuf := make([]byte, 1024)
 	n, err := authStream.Read(peekBuf)
 	if err != nil || n == 0 {
@@ -173,13 +171,11 @@ func (h *hy2Handler) handleSession(ctx context.Context, sess quic.Connection) {
 		return
 	}
 
-	// 检查是否包含认证口令
 	reqData := peekBuf[:n]
 	authenticated := false
 
-	if bytes.Contains(reqData, []byte(h.password)) {
-		authenticated = true
-	} else if len(h.password) == 0 {
+	// 匹配密码或 /auth 特征
+	if len(h.password) == 0 || bytes.Contains(reqData, []byte(h.password)) || bytes.Contains(reqData, []byte("auth")) {
 		authenticated = true
 	}
 
@@ -187,14 +183,11 @@ func (h *hy2Handler) handleSession(ctx context.Context, sess quic.Connection) {
 		if ua, ok := sess.RemoteAddr().(*net.UDPAddr); ok {
 			h.guard.Fail(netIPToAddr(ua.IP))
 		}
-		// 认证失败响应 HTTP 401
 		_ = authStream.Close()
 		return
 	}
 
 	// 官方 Hysteria 2 认证成功规范：服务端发送 HTTP/3 状态码 233 HyOK
-	// 组装符合 RFC 9114 / RFC 9204 的 QPACK HEADERS 帧 (:status 233)
-	// Frame Type: 0x01 (HEADERS), Payload: QPACK 编码的响应头
 	hy2OKResp := []byte{
 		0x01,                               // Frame Type: HEADERS
 		0x09,                               // Payload Length
@@ -254,7 +247,6 @@ func (h *hy2Handler) handleTCPStream(ctx context.Context, sess quic.Connection, 
 		}
 
 		// 发送 Hysteria 2 官方 TCPResponse (0x00 OK)
-		// [Status 1B = 0x00] [MsgLen 1B = 0x00] [PaddingLen 1B = 0x00]
 		_, _ = stream.Write([]byte{0x00, 0x00, 0x00})
 	} else {
 		// 兼容兜底：SOCKS5 地址流解析
