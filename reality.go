@@ -265,8 +265,7 @@ func (h *realityHandler) handle(ctx context.Context, c net.Conn) {
 	tc := tls.Server(client, h.tlsCfg)
 	if err := tc.Handshake(); err != nil {
 		h.guard.Fail(ip)
-		// TLS 握手失败（如主动扫描或探测器），透明回落给真实目标站
-		h.fallbackToDest(ctx, c, br)
+		slog.Debug("tls handshake failed", "remote", ip, "err", err)
 		return
 	}
 	h.inner(ctx, tc)
