@@ -253,9 +253,17 @@ func (h *realityHandler) handle(ctx context.Context, c net.Conn) {
 	// 校验 SNI 是否在允许列表（如果配置了 server_names）
 	if len(h.serverNames) > 0 {
 		if _, ok := h.serverNames[sni]; !ok {
-			h.guard.Fail(ip)
-			h.fallbackToDest(ctx, c, br)
-			return
+			matched := false
+			if h.tlsCfg != nil && h.tlsCfg.GetCertificate != nil {
+				if cert, err := h.tlsCfg.GetCertificate(&tls.ClientHelloInfo{ServerName: sni}); err == nil && cert != nil {
+					matched = true
+				}
+			}
+			if !matched {
+				h.guard.Fail(ip)
+				h.fallbackToDest(ctx, c, br)
+				return
+			}
 		}
 	}
 
