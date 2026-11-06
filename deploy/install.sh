@@ -177,13 +177,11 @@ if [[ ! -f /etc/mproxy/config.json ]]; then
       "listen": "0.0.0.0:443",
       "udp": true,
       "passwords": ["${VLESS_UUID}"],
-      "reality": {
-        "dest": "www.microsoft.com:443",
-        "server_names": ["www.microsoft.com", "microsoft.com"],
-        "private_key": "${REALITY_PRIV}",
-        "public_key": "${REALITY_PUB}",
-        "short_ids": ["${REALITY_SID}"]
-      }
+      "tls": {
+        "cert": "/etc/mproxy/cert.pem",
+        "key": "/etc/mproxy/key.pem"
+      },
+      "fallback": "127.0.0.1:8088"
     },
     {
       "type": "vless",

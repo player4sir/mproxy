@@ -21,13 +21,11 @@
       "listen": "0.0.0.0:443",
       "udp": true,
       "passwords": ["a5e18239-6523-446f-b258-2e06180632a7"],
-      "reality": {
-        "dest": "www.microsoft.com:443",
-        "server_names": ["www.microsoft.com", "microsoft.com"],
-        "private_key": "",
-        "public_key": "",
-        "short_ids": ["0123456789abcdef"]
-      }
+      "tls": {
+        "cert": "/etc/mproxy/cert.pem",
+        "key": "/etc/mproxy/key.pem"
+      },
+      "fallback": "127.0.0.1:8088"
     },
     {
       "type": "vless",
