@@ -16,6 +16,13 @@ type ExportOptions struct {
 	PublicHost string // 外部可访问的公网 IP 或域名
 }
 
+func safeSNI(host string) string {
+	if net.ParseIP(host) != nil {
+		return "www.microsoft.com"
+	}
+	return host
+}
+
 // GenerateClientConfigs 自动生成全平台免配置直接连通的订阅链接与客户端配置
 func GenerateClientConfigs(cfg *Config, opt ExportOptions) string {
 	var sb strings.Builder
@@ -74,7 +81,7 @@ func GenerateClientConfigs(cfg *Config, opt ExportOptions) string {
 				}
 
 				// VLESS + Reality 标准 URI (注入真实合法公钥 pbk，彻底消除 REPLACE_WITH_REALITY_PUBKEY 占位符)
-				link := fmt.Sprintf("vless://%s@%s:%d?encryption=none&flow=xtls-rprx-vision&security=reality&sni=%s&fp=chrome&pbk=%s&sid=%s&type=tcp#mproxy-VLESS-Reality",
+				link := fmt.Sprintf("vless://%s@%s:%d?encryption=none&security=reality&sni=%s&fp=chrome&pbk=%s&sid=%s&type=tcp#mproxy-VLESS-Reality",
 					uuid, host, port, sni, pubKey, sid)
 				sb.WriteString(fmt.Sprintf("[VLESS Reality 节点 (免域名强抗封锁)]\n%s\n\n", link))
 
@@ -87,7 +94,6 @@ func GenerateClientConfigs(cfg *Config, opt ExportOptions) string {
 					"network":            "tcp",
 					"tls":                true,
 					"udp":                true,
-					"flow":               "xtls-rprx-vision",
 					"servername":         sni,
 					"client-fingerprint": "chrome",
 					"reality-opts": map[string]any{
@@ -102,7 +108,6 @@ func GenerateClientConfigs(cfg *Config, opt ExportOptions) string {
 					"server":      host,
 					"server_port": port,
 					"uuid":        uuid,
-					"flow":        "xtls-rprx-vision",
 					"tls": map[string]any{
 						"enabled":     true,
 						"server_name": sni,
@@ -185,8 +190,9 @@ func GenerateClientConfigs(cfg *Config, opt ExportOptions) string {
 
 			} else if l.TLS != nil {
 				// VLESS + TLS
+				sni := safeSNI(host)
 				link := fmt.Sprintf("vless://%s@%s:%d?encryption=none&security=tls&allowInsecure=1&sni=%s&type=tcp#mproxy-VLESS-TLS",
-					uuid, host, port, host)
+					uuid, host, port, sni)
 				sb.WriteString(fmt.Sprintf("[VLESS TLS 节点]\n%s\n\n", link))
 
 				clashProxies = append(clashProxies, map[string]any{
@@ -198,7 +204,7 @@ func GenerateClientConfigs(cfg *Config, opt ExportOptions) string {
 					"network":          "tcp",
 					"tls":              true,
 					"udp":              true,
-					"servername":       host,
+					"servername":       sni,
 					"skip-cert-verify": true,
 				})
 
@@ -210,7 +216,7 @@ func GenerateClientConfigs(cfg *Config, opt ExportOptions) string {
 					"uuid":        uuid,
 					"tls": map[string]any{
 						"enabled":     true,
-						"server_name": host,
+						"server_name": sni,
 						"insecure":    true,
 					},
 				})
@@ -224,8 +230,9 @@ func GenerateClientConfigs(cfg *Config, opt ExportOptions) string {
 			if pw == "" && len(l.Passwords) > 0 {
 				pw = l.Passwords[0]
 			}
+			sni := safeSNI(host)
 			// 注入 insecure=1 与 20000-50000 UDP 端口跳跃支持，粉碎晚高峰 QoS 限速
-			link := fmt.Sprintf("hysteria2://%s@%s:%d?sni=%s&insecure=1&mport=20000-50000#mproxy-Hysteria2-PortHopping", pw, host, port, host)
+			link := fmt.Sprintf("hysteria2://%s@%s:%d?sni=%s&insecure=1&mport=20000-50000#mproxy-Hysteria2-PortHopping", pw, host, port, sni)
 			sb.WriteString(fmt.Sprintf("[Hysteria 2 节点 (极速抗丢包 & 端口跳跃)]\n%s\n\n", link))
 
 			clashProxies = append(clashProxies, map[string]any{
@@ -235,7 +242,7 @@ func GenerateClientConfigs(cfg *Config, opt ExportOptions) string {
 				"port":             port,
 				"ports":            "20000-50000",
 				"password":         pw,
-				"sni":              host,
+				"sni":              sni,
 				"skip-cert-verify": true,
 			})
 
@@ -248,7 +255,7 @@ func GenerateClientConfigs(cfg *Config, opt ExportOptions) string {
 				"password":     pw,
 				"tls": map[string]any{
 					"enabled":     true,
-					"server_name": host,
+					"server_name": sni,
 					"insecure":    true,
 				},
 			})
@@ -258,8 +265,9 @@ func GenerateClientConfigs(cfg *Config, opt ExportOptions) string {
 			if len(l.Passwords) > 0 {
 				pw = l.Passwords[0]
 			}
+			sni := safeSNI(host)
 			// 关键修复：注入 allowInsecure=1 确保 Trojan 自签证书秒通
-			link := fmt.Sprintf("trojan://%s@%s:%d?security=tls&sni=%s&allowInsecure=1#mproxy-Trojan", pw, host, port, host)
+			link := fmt.Sprintf("trojan://%s@%s:%d?security=tls&sni=%s&allowInsecure=1#mproxy-Trojan", pw, host, port, sni)
 			sb.WriteString(fmt.Sprintf("[Trojan 节点]\n%s\n\n", link))
 
 			clashProxies = append(clashProxies, map[string]any{
@@ -268,7 +276,7 @@ func GenerateClientConfigs(cfg *Config, opt ExportOptions) string {
 				"server":           host,
 				"port":             port,
 				"password":         pw,
-				"sni":              host,
+				"sni":              sni,
 				"udp":              true,
 				"skip-cert-verify": true,
 			})
@@ -281,7 +289,7 @@ func GenerateClientConfigs(cfg *Config, opt ExportOptions) string {
 				"password":    pw,
 				"tls": map[string]any{
 					"enabled":     true,
-					"server_name": host,
+					"server_name": sni,
 					"insecure":    true,
 				},
 			})

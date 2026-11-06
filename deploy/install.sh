@@ -60,29 +60,51 @@ echo -e "${GREEN}[3/7]${PLAIN} 部署 mproxy 核心二进制..."
 
 COMPILED=0
 
-# 优先策略：如果本地有源码且有 Go 环境，始终拉取依赖并编译最新版本
+# 如果系统没有 go，自动安装官方 Go 1.22
+if ! command -v go >/dev/null 2>&1 && [[ ! -x /usr/local/go/bin/go ]]; then
+    echo -e "${CYAN}正在配置 Go 编译环境以确保构建最新版核心...${PLAIN}"
+    GO_TAR="go1.22.8.linux-${BIN_ARCH}.tar.gz"
+    if curl -fsSL -o "/tmp/${GO_TAR}" "https://go.dev/dl/${GO_TAR}" 2>/dev/null; then
+        rm -rf /usr/local/go && tar -C /usr/local -xzf "/tmp/${GO_TAR}"
+        rm -f "/tmp/${GO_TAR}"
+        export PATH=$PATH:/usr/local/go/bin
+    elif command -v apt-get >/dev/null 2>&1; then
+        apt-get install -y golang git >/dev/null 2>&1 || true
+    fi
+fi
+if [[ -x /usr/local/go/bin/go ]]; then
+    export PATH=$PATH:/usr/local/go/bin
+fi
+
+# 1. 优先策略：如果本地当前目录有源码，直接本地编译最新版本
 if command -v go >/dev/null 2>&1 && [[ -f "$PROJECT_ROOT/main.go" ]]; then
-    echo -e "${CYAN}检测到本地 Go 环境，正在拉取依赖并编译最新源码...${PLAIN}"
-    (cd "$PROJECT_ROOT" && go mod tidy && go build -trimpath -ldflags="-s -w" -o /usr/local/bin/mproxy-core .)
+    echo -e "${CYAN}检测到本地源码，正在编译最新版本...${PLAIN}"
+    (cd "$PROJECT_ROOT" && go build -trimpath -ldflags="-s -w" -o /usr/local/bin/mproxy-core .)
     chmod +x /usr/local/bin/mproxy-core
     COMPILED=1
 fi
 
-# 如果未执行编译，则尝试从本地文件或 GitHub 下载
-if [[ $COMPILED -eq 0 ]]; then
-    if [[ -f "$PROJECT_ROOT/dist/mproxy-linux-${BIN_ARCH}" ]]; then
-        cp "$PROJECT_ROOT/dist/mproxy-linux-${BIN_ARCH}" /usr/local/bin/mproxy-core
+# 2. 如果是远程一键执行且有 Go，从 GitHub 拉取最新代码直接编译（保证绝对是最新 commit！）
+if [[ $COMPILED -eq 0 ]] && command -v go >/dev/null 2>&1; then
+    echo -e "${CYAN}正在从 GitHub (${GITHUB_REPO}) 拉取最新代码并进行本地编译...${PLAIN}"
+    TMP_SRC=$(mktemp -d)
+    if git clone --depth=1 "https://github.com/${GITHUB_REPO}.git" "$TMP_SRC" 2>/dev/null; then
+        (cd "$TMP_SRC" && go build -trimpath -ldflags="-s -w" -o /usr/local/bin/mproxy-core .)
         chmod +x /usr/local/bin/mproxy-core
-    else
-        echo -e "${CYAN}正在从 GitHub (${GITHUB_REPO}) 获取预编译程序...${PLAIN}"
-        RAW_BIN_URL="https://raw.githubusercontent.com/${GITHUB_REPO}/main/dist/mproxy-linux-${BIN_ARCH}"
-        RELEASE_BIN_URL="https://github.com/${GITHUB_REPO}/releases/latest/download/mproxy-linux-${BIN_ARCH}"
-        
-        if curl -fsSL -o /usr/local/bin/mproxy-core "$RAW_BIN_URL" 2>/dev/null; then
-            chmod +x /usr/local/bin/mproxy-core
-        elif curl -fsSL -o /usr/local/bin/mproxy-core "$RELEASE_BIN_URL" 2>/dev/null; then
-            chmod +x /usr/local/bin/mproxy-core
-        fi
+        rm -rf "$TMP_SRC"
+        COMPILED=1
+    fi
+fi
+
+# 3. 如果编译未能完成，降级到下载预编译版本
+if [[ $COMPILED -eq 0 ]]; then
+    RELEASE_BIN_URL="https://github.com/${GITHUB_REPO}/releases/latest/download/mproxy-linux-${BIN_ARCH}"
+    RAW_BIN_URL="https://raw.githubusercontent.com/${GITHUB_REPO}/main/dist/mproxy-linux-${BIN_ARCH}"
+    echo -e "${CYAN}正在从 GitHub 获取预编译程序...${PLAIN}"
+    if curl -fsSL -o /usr/local/bin/mproxy-core "$RELEASE_BIN_URL" 2>/dev/null; then
+        chmod +x /usr/local/bin/mproxy-core
+    elif curl -fsSL -o /usr/local/bin/mproxy-core "$RAW_BIN_URL" 2>/dev/null; then
+        chmod +x /usr/local/bin/mproxy-core
     fi
 fi
 
