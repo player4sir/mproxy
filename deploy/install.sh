@@ -117,7 +117,6 @@ fi
 # 若不存在配置文件，则全自动生成高强度凭证配置文件
 if [[ ! -f /etc/mproxy/config.json ]]; then
     VLESS_UUID=$(openssl rand -hex 16 | awk '{print substr($0,1,8)"-"substr($0,9,4)"-"substr($0,13,4)"-"substr($0,17,4)"-"substr($0,21,12)}')
-    REALITY_SID=$(openssl rand -hex 8)
     TROJAN_PW=$(openssl rand -base64 16 | tr -dc 'a-zA-Z0-9' | head -c 16)
     HY2_PW=$(openssl rand -base64 16 | tr -dc 'a-zA-Z0-9' | head -c 16)
     SS_PW=$(openssl rand -base64 16 | tr -dc 'a-zA-Z0-9' | head -c 16)
@@ -147,10 +146,9 @@ if [[ ! -f /etc/mproxy/config.json ]]; then
       "listen": "0.0.0.0:443",
       "udp": true,
       "passwords": ["${VLESS_UUID}"],
-      "reality": {
-        "dest": "www.microsoft.com:443",
-        "server_names": ["www.microsoft.com", "microsoft.com"],
-        "short_ids": ["${REALITY_SID}"]
+      "tls": {
+        "cert": "/etc/mproxy/cert.pem",
+        "key": "/etc/mproxy/key.pem"
       }
     },
     {
