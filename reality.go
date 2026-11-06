@@ -243,7 +243,7 @@ func (h *realityHandler) handle(ctx context.Context, c net.Conn) {
 	_ = c.SetDeadline(time.Now().Add(h.lim.HandshakeTimeout.Duration))
 	br := bufio.NewReaderSize(c, 8192)
 
-	sni, sessID, _, err := sniffClientHello(br)
+	sni, _, _, err := sniffClientHello(br)
 	if err != nil {
 		// 非 TLS 请求，直接回落透传到真实目标站
 		h.fallbackToDest(ctx, c, br)
