@@ -78,8 +78,8 @@ fi
 
 # 1. 优先策略：如果本地当前目录有源码，直接本地编译最新版本
 if command -v go >/dev/null 2>&1 && [[ -f "$PROJECT_ROOT/main.go" ]]; then
-    echo -e "${CYAN}检测到本地源码，正在编译最新版本...${PLAIN}"
-    (cd "$PROJECT_ROOT" && go build -trimpath -ldflags="-s -w" -o /usr/local/bin/mproxy-core .)
+    echo -e "${CYAN}检测到本地源码，正在整理依赖并编译最新版本...${PLAIN}"
+    (cd "$PROJECT_ROOT" && go mod tidy && go build -trimpath -ldflags="-s -w" -o /usr/local/bin/mproxy-core .)
     chmod +x /usr/local/bin/mproxy-core
     COMPILED=1
 fi
@@ -89,7 +89,7 @@ if [[ $COMPILED -eq 0 ]] && command -v go >/dev/null 2>&1; then
     echo -e "${CYAN}正在从 GitHub (${GITHUB_REPO}) 拉取最新代码并进行本地编译...${PLAIN}"
     TMP_SRC=$(mktemp -d)
     if git clone --depth=1 "https://github.com/${GITHUB_REPO}.git" "$TMP_SRC" 2>/dev/null; then
-        (cd "$TMP_SRC" && go build -trimpath -ldflags="-s -w" -o /usr/local/bin/mproxy-core .)
+        (cd "$TMP_SRC" && go mod tidy && go build -trimpath -ldflags="-s -w" -o /usr/local/bin/mproxy-core .)
         chmod +x /usr/local/bin/mproxy-core
         rm -rf "$TMP_SRC"
         COMPILED=1
