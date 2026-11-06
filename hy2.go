@@ -11,12 +11,9 @@ import (
 	"net"
 	"net/netip"
 	"strconv"
-	"strings"
-	"sync"
 	"time"
 
 	"github.com/quic-go/quic-go"
-	"github.com/quic-go/quic-go/http3"
 	"github.com/quic-go/quic-go/quicvarint"
 )
 
@@ -199,11 +196,11 @@ func (h *hy2Handler) handleSession(ctx context.Context, sess quic.Connection) {
 	// 组装符合 RFC 9114 / RFC 9204 的 QPACK HEADERS 帧 (:status 233)
 	// Frame Type: 0x01 (HEADERS), Payload: QPACK 编码的响应头
 	hy2OKResp := []byte{
-		0x01,                   // Frame Type: HEADERS
-		0x09,                   // Payload Length
-		0x00, 0x00,             // Required Insert Count & Base
+		0x01,                               // Frame Type: HEADERS
+		0x09,                               // Payload Length
+		0x00, 0x00,                         // Required Insert Count & Base
 		0x5f, 0x10, 0x83, 0x49, 0x7e, 0xab, // QPACK 压缩响应状态码 233
-		0x00,                   // 结束位
+		0x00,                               // 结束位
 	}
 	_, _ = authStream.Write(hy2OKResp)
 	authStream.Close()
