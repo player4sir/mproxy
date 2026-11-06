@@ -81,6 +81,14 @@ func run(ctx context.Context, cfg *Config) error {
 	udpMgr := NewUDPManager(out, cfg.Limits.IdleTimeout.Duration)
 	defer udpMgr.Close()
 
+	// 收集外部 listener 占用的端口，严禁回落服务与核心监听器端口冲突导致 bind 失败
+	listenerPorts := make(map[string]bool)
+	for _, lc := range cfg.Listeners {
+		if _, p, err := net.SplitHostPort(lc.Listen); err == nil {
+			listenerPorts[p] = true
+		}
+	}
+
 	// 启动内置反探测伪装站点（针对配置了本地 127.0.0.1 等本地回落地址的监听器）
 	startedFallbacks := make(map[string]bool)
 	for _, lc := range cfg.Listeners {
@@ -92,8 +100,8 @@ func run(ctx context.Context, cfg *Config) error {
 			addrs = append(addrs, lc.Hy2.Masquerade)
 		}
 		for _, addr := range addrs {
-			h, _, err := net.SplitHostPort(addr)
-			if err == nil && (h == "127.0.0.1" || h == "localhost" || h == "::1") {
+			h, p, err := net.SplitHostPort(addr)
+			if err == nil && (h == "127.0.0.1" || h == "localhost" || h == "::1") && !listenerPorts[p] {
 				if !startedFallbacks[addr] {
 					startedFallbacks[addr] = true
 					if err := StartEmbeddedFallback(ctx, addr); err != nil {
@@ -221,7 +229,8 @@ func run(ctx context.Context, cfg *Config) error {
 		lcfg := net.ListenConfig{KeepAlive: 30 * time.Second}
 		ln, err := lcfg.Listen(ctx, "tcp", lc.Listen)
 		if err != nil {
-			return fmt.Errorf("listen tcp %s: %w", lc.Listen, err)
+			slog.Error("listen tcp failed, skipping listener", "type", lc.Type, "addr", lc.Listen, "err", err)
+			continue
 		}
 		slog.Info("listening tcp", "type", lc.Type, "addr", ln.Addr())
 		servers = append(servers, &Server{name: lc.Type + "@" + lc.Listen, ln: ln, guard: guard, h: h, wg: &wg})

@@ -208,7 +208,7 @@ if [[ ! -f /etc/mproxy/config.json ]]; then
       "hy2": {
         "password": "${HY2_PW}",
         "alpn": ["h3"],
-        "masquerade": "127.0.0.1:8080"
+        "masquerade": "127.0.0.1:8088"
       }
     },
     {
@@ -220,7 +220,7 @@ if [[ ! -f /etc/mproxy/config.json ]]; then
         "key": "/etc/mproxy/key.pem"
       },
       "passwords": ["${TROJAN_PW}"],
-      "fallback": "127.0.0.1:8080",
+      "fallback": "127.0.0.1:8088",
       "fallback_proxy_protocol": true
     },
     {

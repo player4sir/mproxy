@@ -52,7 +52,7 @@
       "hy2": {
         "password": "CHANGE_ME_HY2_SECURE_TOKEN",
         "alpn": ["h3"],
-        "masquerade": "127.0.0.1:8080"
+        "masquerade": "127.0.0.1:8088"
       }
     },
     {
@@ -64,7 +64,7 @@
         "key": "/etc/letsencrypt/live/example.com/privkey.pem"
       },
       "passwords": ["CHANGE_ME_LONG_RANDOM_TROJAN_PASSWORD"],
-      "fallback": "127.0.0.1:8080",
+      "fallback": "127.0.0.1:8088",
       "fallback_proxy_protocol": true
     },
     {
