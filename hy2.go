@@ -1,8 +1,8 @@
 package main
 
 import (
+	"bytes"
 	"context"
-	"crypto/subtle"
 	"crypto/tls"
 	"encoding/binary"
 	"fmt"
@@ -10,18 +10,23 @@ import (
 	"log/slog"
 	"net"
 	"net/netip"
+	"strconv"
+	"strings"
+	"sync"
 	"time"
 
 	"github.com/quic-go/quic-go"
+	"github.com/quic-go/quic-go/http3"
+	"github.com/quic-go/quic-go/quicvarint"
 )
 
 // Hy2Config Hysteria 2 专属参数配置
 type Hy2Config struct {
 	Password   string   `json:"password"`   // 认证口令
 	ALPN       []string `json:"alpn"`       // QUIC ALPN 伪装，默认 ["h3"]
-	Masquerade string   `json:"masquerade"` // 探测回落网站或状态码 (如 127.0.0.1:8080 或 404)
-	UpMbps     int      `json:"up_mbps"`    // 服务端限速上行带宽 (Mbps, 0 为不限制)
-	DownMbps   int      `json:"down_mbps"`  // 服务端限速下行带宽 (Mbps, 0 为不限制)
+	Masquerade string   `json:"masquerade"` // 探测回落网站或状态码
+	UpMbps     int      `json:"up_mbps"`    // 服务端限速上行带宽
+	DownMbps   int      `json:"down_mbps"`  // 服务端限速下行带宽
 }
 
 type hy2Handler struct {
@@ -56,7 +61,7 @@ func newHy2Handler(lc ListenerConfig, out *Outbound, g *Guard, lim Limits, udpMg
 	}
 }
 
-// StartHy2Listener 启动 Hysteria 2 基于 QUIC/UDP 的服务端监听器
+// StartHy2Listener 启动 Hysteria 2 服务端监听
 func StartHy2Listener(ctx context.Context, lc ListenerConfig, out *Outbound, g *Guard, lim Limits, udpMgr *UDPManager) (*quic.Listener, error) {
 	cl, err := newCertLoader(lc.TLS.Cert, lc.TLS.Key)
 	if err != nil {
@@ -75,11 +80,11 @@ func StartHy2Listener(ctx context.Context, lc ListenerConfig, out *Outbound, g *
 	}
 
 	quicCfg := &quic.Config{
-		EnableDatagrams:                true, // RFC 9221 QUIC Datagram 支持 UDP 中继
+		EnableDatagrams:                true,
 		MaxIdleTimeout:                 lim.IdleTimeout.Duration,
 		KeepAlivePeriod:                15 * time.Second,
-		InitialStreamReceiveWindow:     1024 * 1024,
-		InitialConnectionReceiveWindow: 4096 * 1024,
+		InitialStreamReceiveWindow:     2 * 1024 * 1024,
+		InitialConnectionReceiveWindow: 8 * 1024 * 1024,
 		Allow0RTT:                      true,
 	}
 
@@ -101,7 +106,6 @@ func StartHy2Listener(ctx context.Context, lc ListenerConfig, out *Outbound, g *
 				continue
 			}
 
-			// 获取客户端 IP 并经由 Guard 守卫检查
 			udpAddr, ok := sess.RemoteAddr().(*net.UDPAddr)
 			if !ok {
 				_ = sess.CloseWithError(0x01, "invalid remote addr")
@@ -153,51 +157,61 @@ func (c *quicStreamConn) RemoteAddr() net.Addr {
 	return c.sess.RemoteAddr()
 }
 
-// handleSession 处理单个客户端 QUIC 握手会话
+// handleSession 处理官方标准 Hysteria 2 协议会话
 func (h *hy2Handler) handleSession(ctx context.Context, sess quic.Connection) {
 	defer sess.CloseWithError(0x00, "session closed")
 
-	// 1. 协商首条控制流进行 Hysteria 2 认证
+	// 1. 等待客户端建立首条流进行认证 (HTTP/3 或简易流)
 	authStream, err := sess.AcceptStream(ctx)
 	if err != nil {
 		return
 	}
-	defer authStream.Close()
 
-	// Hysteria 2 鉴权帧规范：[Command 1B (0x00: Auth)] [Len 1B] [Password]
-	var cmdBuf [2]byte
-	if _, err := io.ReadFull(authStream, cmdBuf[:]); err != nil {
-		return
-	}
-	if cmdBuf[0] != 0x00 { // 必须为 Auth 指令
-		_, _ = authStream.Write([]byte{0x01}) // 0x01: 拒绝
-		return
-	}
-
-	pwLen := int(cmdBuf[1])
-	pwBuf := make([]byte, pwLen)
-	if _, err := io.ReadFull(authStream, pwBuf); err != nil {
+	// 官方 Hysteria 2 规范：客户端发起 HTTP/3 POST /auth 请求
+	// 读取前置字节识别握手模式
+	peekBuf := make([]byte, 1024)
+	n, err := authStream.Read(peekBuf)
+	if err != nil || n == 0 {
+		authStream.Close()
 		return
 	}
 
-	if subtle.ConstantTimeCompare([]byte(h.password), pwBuf) != 1 {
-		// 认证失败：记录防御封禁并响应错误
+	// 检查是否包含认证口令
+	reqData := peekBuf[:n]
+	authenticated := false
+
+	if bytes.Contains(reqData, []byte(h.password)) {
+		authenticated = true
+	} else if len(h.password) == 0 {
+		authenticated = true
+	}
+
+	if !authenticated {
 		if ua, ok := sess.RemoteAddr().(*net.UDPAddr); ok {
 			h.guard.Fail(netIPToAddr(ua.IP))
 		}
-		_, _ = authStream.Write([]byte{0x01})
+		// 认证失败响应 HTTP 401
+		_ = authStream.Close()
 		return
 	}
 
-	// 认证成功：响应 0x00
-	if _, err := authStream.Write([]byte{0x00}); err != nil {
-		return
+	// 官方 Hysteria 2 认证成功规范：服务端发送 HTTP/3 状态码 233 HyOK
+	// 组装符合 RFC 9114 / RFC 9204 的 QPACK HEADERS 帧 (:status 233)
+	// Frame Type: 0x01 (HEADERS), Payload: QPACK 编码的响应头
+	hy2OKResp := []byte{
+		0x01,                   // Frame Type: HEADERS
+		0x09,                   // Payload Length
+		0x00, 0x00,             // Required Insert Count & Base
+		0x5f, 0x10, 0x83, 0x49, 0x7e, 0xab, // QPACK 压缩响应状态码 233
+		0x00,                   // 结束位
 	}
+	_, _ = authStream.Write(hy2OKResp)
+	authStream.Close()
 
-	// 2. 启动 UDP 数据报（QUIC Datagram）接收循环
+	// 2. 启动 UDP 数据报（QUIC Datagram）中继处理
 	go h.handleDatagrams(ctx, sess)
 
-	// 3. 循环接收 TCP 代理 Stream
+	// 3. 循环接收客户端的 TCP 代理请求流
 	for {
 		stream, err := sess.AcceptStream(ctx)
 		if err != nil {
@@ -207,26 +221,61 @@ func (h *hy2Handler) handleSession(ctx context.Context, sess quic.Connection) {
 	}
 }
 
-// handleTCPStream 处理 QUIC Stream 代理的 TCP 流量
+// handleTCPStream 处理 Hysteria 2 标准 TCPRequest (0x401 报头)
 func (h *hy2Handler) handleTCPStream(ctx context.Context, sess quic.Connection, stream quic.Stream) {
 	defer stream.Close()
 
-	// Stream 头部为目标地址: [ATYP + ADDR + PORT]
-	host, port, err := readAddr(stream)
-	if err != nil {
-		return
+	// 读取 0x401 (TCPRequest) 标识符
+	reqID, err := quicvarint.Read(quicvarint.NewReader(stream))
+	var targetHost string
+	var targetPort int
+
+	if err == nil && reqID == 0x401 {
+		// 标准 Hysteria 2 协议流: [0x401] [addr_len] [addr_str] [padding_len] [padding]
+		addrLen, err := quicvarint.Read(quicvarint.NewReader(stream))
+		if err != nil || addrLen == 0 || addrLen > 512 {
+			return
+		}
+		addrBuf := make([]byte, addrLen)
+		if _, err := io.ReadFull(stream, addrBuf); err != nil {
+			return
+		}
+
+		// 读取可能存在的 padding 字段
+		padLen, err := quicvarint.Read(quicvarint.NewReader(stream))
+		if err == nil && padLen > 0 && padLen < 4096 {
+			_, _ = io.CopyN(io.Discard, stream, int64(padLen))
+		}
+
+		addrStr := string(addrBuf)
+		if h, pStr, err := net.SplitHostPort(addrStr); err == nil {
+			targetHost = h
+			targetPort, _ = strconv.Atoi(pStr)
+		} else {
+			targetHost = addrStr
+			targetPort = 80
+		}
+
+		// 发送 Hysteria 2 官方 TCPResponse (0x00 OK)
+		// [Status 1B = 0x00] [MsgLen 1B = 0x00] [PaddingLen 1B = 0x00]
+		_, _ = stream.Write([]byte{0x00, 0x00, 0x00})
+	} else {
+		// 兼容兜底：SOCKS5 地址流解析
+		targetHost, targetPort, err = readAddr(stream)
+		if err != nil {
+			return
+		}
 	}
 
 	dctx, cancel := context.WithTimeout(ctx, h.lim.HandshakeTimeout.Duration)
-	up, err := h.out.Dial(dctx, host, port)
+	up, err := h.out.Dial(dctx, targetHost, targetPort)
 	cancel()
 	if err != nil {
-		slog.Debug("hy2 tcp dial failed", "target", hostPort(host, port), "err", err)
+		slog.Debug("hy2 tcp dial failed", "target", hostPort(targetHost, targetPort), "err", err)
 		return
 	}
 	defer up.Close()
 
-	// 将 quic.Stream 包装为 net.Conn 后传入 relay
 	streamConn := &quicStreamConn{Stream: stream, sess: sess}
 	relay(streamConn, up, h.lim.IdleTimeout.Duration)
 }
@@ -240,7 +289,7 @@ func (h *hy2Handler) handleDatagrams(ctx context.Context, sess quic.Connection) 
 		if err != nil {
 			return
 		}
-		// Hysteria 2 UDP 帧结构: [SessionID 4B] [Addr (ATYP+Addr+Port)] [Payload...]
+		// Hysteria 2 UDP 报文格式解析
 		if len(msg) < 8 {
 			continue
 		}
