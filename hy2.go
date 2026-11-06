@@ -167,6 +167,13 @@ func (c *quicStreamConn) RemoteAddr() net.Addr {
 func (h *hy2Handler) handleSession(ctx context.Context, sess quic.Connection) {
 	defer sess.CloseWithError(0x00, "session closed")
 
+	// 0. 发送 HTTP/3 Control Stream 与 SETTINGS 帧 (RFC 9114 规范强制要求)
+	go func() {
+		if uni, err := sess.OpenUniStream(); err == nil {
+			_, _ = uni.Write([]byte{0x00, 0x04, 0x00}) // StreamType=0x00(Control), FrameType=0x04(SETTINGS), Length=0x00
+		}
+	}()
+
 	// 1. 等待客户端建立首条流进行认证 (HTTP/3 POST /auth 请求)
 	authStream, err := sess.AcceptStream(ctx)
 	if err != nil {
@@ -204,20 +211,20 @@ func (h *hy2Handler) handleSession(ctx context.Context, sess quic.Connection) {
 	// 包含 :status: 233, hysteria-udp: true, hysteria-cc-rx: auto
 	hy2OKResp := []byte{
 		0x01,       // HTTP/3 Frame Type: HEADERS
-		0x2f,       // Payload 长度 (47 字节)
+		0x32,       // Payload 长度 (50 字节)
 		0x00, 0x00, // QPACK Prefix: Required Insert Count = 0, Base = 0
 
-		// Header 1: :status = 233 (T=1, Static Table Index 24 for :status, H=0, Len=3)
-		0x58, 0x03, '2', '3', '3',
+		// Header 1: :status = 233 (RFC 9204 QPACK Name Reference: 0x5f, Index=15+48=63 (:status), ValLen=3)
+		0x5f, 0x30, 0x03, '2', '3', '3',
 
-		// Header 2: hysteria-udp = true (Literal without Name Reference: 0x20, NameLen=12, ValLen=4)
-		0x20, 0x0c,
+		// Header 2: hysteria-udp = true (RFC 9204 QPACK Literal Name: 0x27, NameLen=7+5=12, ValLen=4)
+		0x27, 0x05,
 		'h', 'y', 's', 't', 'e', 'r', 'i', 'a', '-', 'u', 'd', 'p',
 		0x04,
 		't', 'r', 'u', 'e',
 
-		// Header 3: hysteria-cc-rx = auto (Literal without Name Reference: 0x20, NameLen=14, ValLen=4)
-		0x20, 0x0e,
+		// Header 3: hysteria-cc-rx = auto (RFC 9204 QPACK Literal Name: 0x27, NameLen=7+7=14, ValLen=4)
+		0x27, 0x07,
 		'h', 'y', 's', 't', 'e', 'r', 'i', 'a', '-', 'c', 'c', '-', 'r', 'x',
 		0x04,
 		'a', 'u', 't', 'o',
