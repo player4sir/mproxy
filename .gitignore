@@ -1,0 +1,15 @@
+# Binaries
+/mproxy
+dist/
+
+# TLS Keys & Certs
+*.pem
+*.key
+*.crt
+
+# OS & Editor
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.log

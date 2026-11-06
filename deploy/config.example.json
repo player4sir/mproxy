@@ -1,0 +1,89 @@
+{
+  "log_level": "info",
+  "metrics_listen": "127.0.0.1:9090",
+  "limits": {
+    "max_conns": 20000,
+    "max_conns_per_ip": 512,
+    "idle_timeout": "5m",
+    "handshake_timeout": "10s",
+    "ban_after_failures": 8,
+    "ban_duration": "10m",
+    "shutdown_grace": "30s"
+  },
+  "outbound": {
+    "dial_timeout": "8s",
+    "block_private": true,
+    "bind": ""
+  },
+  "listeners": [
+    {
+      "type": "vless",
+      "listen": "0.0.0.0:443",
+      "udp": true,
+      "passwords": ["a5e18239-6523-446f-b258-2e06180632a7"],
+      "reality": {
+        "dest": "www.microsoft.com:443",
+        "server_names": ["www.microsoft.com", "microsoft.com"],
+        "short_ids": ["0123456789abcdef"]
+      }
+    },
+    {
+      "type": "vless",
+      "listen": "0.0.0.0:8080",
+      "udp": true,
+      "passwords": ["a5e18239-6523-446f-b258-2e06180632a7"],
+      "transport": {
+        "type": "ws",
+        "ws": {
+          "path": "/vless-ws"
+        }
+      }
+    },
+    {
+      "type": "hysteria2",
+      "listen": "0.0.0.0:8443",
+      "udp": true,
+      "tls": {
+        "cert": "/etc/letsencrypt/live/example.com/fullchain.pem",
+        "key": "/etc/letsencrypt/live/example.com/privkey.pem"
+      },
+      "hy2": {
+        "password": "CHANGE_ME_HY2_SECURE_TOKEN",
+        "alpn": ["h3"],
+        "masquerade": "127.0.0.1:8080"
+      }
+    },
+    {
+      "type": "trojan",
+      "listen": "0.0.0.0:9443",
+      "udp": true,
+      "tls": {
+        "cert": "/etc/letsencrypt/live/example.com/fullchain.pem",
+        "key": "/etc/letsencrypt/live/example.com/privkey.pem"
+      },
+      "passwords": ["CHANGE_ME_LONG_RANDOM_TROJAN_PASSWORD"],
+      "fallback": "127.0.0.1:8080",
+      "fallback_proxy_protocol": true
+    },
+    {
+      "type": "shadowsocks",
+      "listen": "0.0.0.0:8388",
+      "udp": true,
+      "method": "aes-256-gcm",
+      "password": "CHANGE_ME_ANOTHER_LONG_RANDOM_PASSWORD"
+    },
+    {
+      "type": "socks5",
+      "listen": "127.0.0.1:1080",
+      "udp": true,
+      "users": {
+        "admin": "CHANGE_ME_SOCKS5_PASSWORD"
+      }
+    },
+    {
+      "type": "http",
+      "listen": "127.0.0.1:8118",
+      "users": {}
+    }
+  ]
+}

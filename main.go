@@ -1,0 +1,254 @@
+package main
+
+import (
+	"bufio"
+	"context"
+	"crypto/tls"
+	"encoding/json"
+	"flag"
+	"fmt"
+	"log/slog"
+	"net"
+	"net/http"
+	"os"
+	"os/signal"
+	"sync"
+	"syscall"
+	"time"
+
+	"github.com/quic-go/quic-go"
+)
+
+func main() {
+	cfgPath := flag.String("c", "config.json", "config file path")
+	check := flag.Bool("t", false, "test config syntax and exit")
+	sub := flag.Bool("sub", false, "generate client configs (sing-box, Clash.Meta, v2rayN) and exit")
+	host := flag.String("host", "", "public IP or domain name for client configs generation")
+	flag.Parse()
+
+	cfg, err := loadConfig(*cfgPath)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "config error:", err)
+		os.Exit(1)
+	}
+	if *check {
+		fmt.Println("config ok")
+		return
+	}
+
+	// 导出全平台客户端订阅与节点配置
+	if *sub {
+		pubHost := *host
+		if pubHost == "" {
+			pubHost = "YOUR_SERVER_IP"
+		}
+		fmt.Print(GenerateClientConfigs(cfg, ExportOptions{PublicHost: pubHost}))
+		return
+	}
+
+	lv := slog.LevelInfo
+	_ = lv.UnmarshalText([]byte(cfg.LogLevel))
+	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: lv})))
+
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
+	if err := run(ctx, cfg); err != nil {
+		slog.Error("fatal", "err", err)
+		os.Exit(1)
+	}
+}
+
+func run(ctx context.Context, cfg *Config) error {
+	out, err := NewOutbound(cfg.Outbound)
+	if err != nil {
+		return fmt.Errorf("outbound init: %w", err)
+	}
+	guard := NewGuard(cfg.Limits)
+	udpMgr := NewUDPManager(out, cfg.Limits.IdleTimeout.Duration)
+	defer udpMgr.Close()
+
+	var wg sync.WaitGroup
+	var servers []*Server
+	var udpListeners []*net.UDPConn
+	var quicListeners []*quic.Listener
+
+	for _, lc := range cfg.Listeners {
+		// Hysteria 2 基于 QUIC/UDP，独立处理监听器初始化
+		if lc.Type == "hysteria2" || lc.Type == "hy2" {
+			hy2Ln, err := StartHy2Listener(ctx, lc, out, guard, cfg.Limits, udpMgr)
+			if err != nil {
+				return fmt.Errorf("hy2 %s: %w", lc.Listen, err)
+			}
+			quicListeners = append(quicListeners, hy2Ln)
+			continue
+		}
+
+		var h Handler
+		switch lc.Type {
+		case "socks5":
+			h = (&socks5Handler{users: lc.Users, out: out, guard: guard, lim: cfg.Limits, udpMgr: udpMgr}).handle
+
+		case "http":
+			h = (&httpHandler{users: lc.Users, out: out, guard: guard, lim: cfg.Limits}).handle
+
+		case "shadowsocks":
+			sh := newSSHandler(lc, out, guard, cfg.Limits, udpMgr)
+			h = sh.handle
+			if lc.UDP {
+				uAddr, err := net.ResolveUDPAddr("udp", lc.Listen)
+				if err != nil {
+					return fmt.Errorf("resolve ss udp %s: %w", lc.Listen, err)
+				}
+				uLn, err := net.ListenUDP("udp", uAddr)
+				if err != nil {
+					return fmt.Errorf("listen ss udp %s: %w", lc.Listen, err)
+				}
+				udpListeners = append(udpListeners, uLn)
+				slog.Info("listening udp", "type", "shadowsocks", "addr", uLn.LocalAddr())
+				go sh.ServeUDP(ctx, uLn)
+			}
+
+		case "trojan":
+			th, err := newTrojanHandler(lc, out, guard, cfg.Limits, udpMgr)
+			if err != nil {
+				return fmt.Errorf("trojan %s: %w", lc.Listen, err)
+			}
+			h = th.handle
+			if lc.Reality != nil {
+				rh, err := newRealityHandler(lc.Reality, h, guard, cfg.Limits)
+				if err != nil {
+					return fmt.Errorf("trojan reality %s: %w", lc.Listen, err)
+				}
+				h = rh.handle
+			}
+
+		case "vless":
+			vh, err := newVLESSHandler(lc, out, guard, cfg.Limits, udpMgr)
+			if err != nil {
+				return fmt.Errorf("vless %s: %w", lc.Listen, err)
+			}
+			innerHandler := vh.handle
+
+			if lc.Reality != nil {
+				rh, err := newRealityHandler(lc.Reality, innerHandler, guard, cfg.Limits)
+				if err != nil {
+					return fmt.Errorf("vless reality %s: %w", lc.Listen, err)
+				}
+				h = rh.handle
+			} else if lc.TLS != nil {
+				cl, err := newCertLoader(lc.TLS.Cert, lc.TLS.Key)
+				if err != nil {
+					return fmt.Errorf("vless tls %s: %w", lc.Listen, err)
+				}
+				tlsCfg := &tls.Config{
+					GetCertificate: cl.get,
+					MinVersion:     tls.VersionTLS12,
+					NextProtos:     []string{"h2", "http/1.1"},
+				}
+				h = func(ctx context.Context, c net.Conn) {
+					tc := tls.Server(c, tlsCfg)
+					if err := tc.Handshake(); err != nil {
+						guard.Fail(addrOf(c))
+						return
+					}
+					innerHandler(ctx, tc)
+				}
+			} else {
+				h = innerHandler
+			}
+		}
+
+		// 如果配置了 WebSocket 传输层（例如 Cloudflare CDN 代理中转）
+		if lc.Transport != nil && lc.Transport.Type == "ws" {
+			upstreamHandler := h
+			wsCfg := lc.Transport.WS
+			h = func(ctx context.Context, c net.Conn) {
+				br := bufio.NewReaderSize(c, 8192)
+				wsConn, err := UpgradeWebSocket(c, br, wsCfg)
+				if err != nil {
+					guard.Fail(addrOf(c))
+					return
+				}
+				upstreamHandler(ctx, wsConn)
+			}
+		}
+
+		lcfg := net.ListenConfig{KeepAlive: 30 * time.Second}
+		ln, err := lcfg.Listen(ctx, "tcp", lc.Listen)
+		if err != nil {
+			return fmt.Errorf("listen tcp %s: %w", lc.Listen, err)
+		}
+		slog.Info("listening tcp", "type", lc.Type, "addr", ln.Addr())
+		servers = append(servers, &Server{name: lc.Type + "@" + lc.Listen, ln: ln, guard: guard, h: h, wg: &wg})
+	}
+
+	for _, s := range servers {
+		go s.Serve(ctx)
+	}
+
+	// 监控指标与订阅接口
+	var ms *http.Server
+	if cfg.MetricsListen != "" {
+		mux := http.NewServeMux()
+		mux.HandleFunc("/metrics", func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]int64{
+				"active":       stats.Active.Load(),
+				"total":        stats.Total.Load(),
+				"auth_fail":    stats.AuthFail.Load(),
+				"banned_drops": stats.Banned.Load(),
+				"rejected":     stats.Rejected.Load(),
+				"bytes_up":     stats.BytesUp.Load(),
+				"bytes_down":   stats.BytesDown.Load(),
+				"udp_sessions": udpMgr.activeSess.Load(),
+			})
+		})
+		mux.HandleFunc("/sub", func(w http.ResponseWriter, r *http.Request) {
+			pubHost := r.URL.Query().Get("host")
+			if pubHost == "" {
+				pubHost = r.Host
+				if h, _, err := net.SplitHostPort(pubHost); err == nil {
+					pubHost = h
+				}
+			}
+			w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+			_, _ = w.Write([]byte(GenerateClientConfigs(cfg, ExportOptions{PublicHost: pubHost})))
+		})
+		ms = &http.Server{Addr: cfg.MetricsListen, Handler: mux, ReadHeaderTimeout: 5 * time.Second}
+		go func() {
+			if err := ms.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+				slog.Error("metrics server", "err", err)
+			}
+		}()
+	}
+
+	<-ctx.Done()
+	slog.Info("shutting down: closing listeners, draining active connections", "grace", cfg.Limits.ShutdownGrace.Duration)
+	for _, s := range servers {
+		_ = s.ln.Close()
+	}
+	for _, u := range udpListeners {
+		_ = u.Close()
+	}
+	for _, qln := range quicListeners {
+		_ = qln.Close()
+	}
+	if ms != nil {
+		_ = ms.Close()
+	}
+
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		slog.Info("all connections drained cleanly")
+	case <-time.After(cfg.Limits.ShutdownGrace.Duration):
+		slog.Warn("shutdown grace period expired, exiting", "remaining_active", stats.Active.Load())
+	}
+	return nil
+}
