@@ -94,9 +94,12 @@ view_sub() {
         echo -e "${RED}[错误] 配置文件不存在: $CONFIG_FILE${PLAIN}"
         return
     fi
-    local ip=$(curl -s4 --max-time 3 ip.sb || curl -s4 --max-time 3 ifconfig.me || echo "YOUR_SERVER_IP")
-    echo -e "${CYAN}正在根据服务器公网 IP ($ip) 生成订阅与节点配置...${PLAIN}\n"
-    "$BIN_CORE" -sub -host "$ip" -c "$CONFIG_FILE"
+    local host_arg="$1"
+    if [[ -z "$host_arg" ]]; then
+        host_arg=$(curl -s4 --max-time 3 ip.sb || curl -s4 --max-time 3 ifconfig.me || echo "YOUR_SERVER_IP")
+    fi
+    echo -e "${CYAN}正在生成节点与订阅配置 (地址: $host_arg)...${PLAIN}\n"
+    "$BIN_CORE" -sub -host "$host_arg" -c "$CONFIG_FILE"
 }
 
 # 编辑配置文件
@@ -114,6 +117,67 @@ edit_config() {
     choice=${choice:-Y}
     if [[ "$choice" =~ ^[Yy]$ ]]; then
         restart_service
+    fi
+}
+
+# 申请正规 Let's Encrypt 证书
+apply_cert() {
+    check_root
+    local domain="$1"
+    local srv_ip=$(curl -s4 --max-time 3 ip.sb || curl -s4 --max-time 3 ifconfig.me || echo "")
+
+    if [[ -z "$domain" ]]; then
+        echo -e "${YELLOW}请输入已解析到当前服务器 ($srv_ip) 的域名: ${PLAIN}\c"
+        read -r domain
+    fi
+
+    if [[ -z "$domain" ]]; then
+        echo -e "${RED}[错误] 域名不能为空！${PLAIN}"
+        return
+    fi
+
+    echo -e "${CYAN}正在校验域名 DNS 解析...${PLAIN}"
+    local resolved_ip=$(ping -c 1 "$domain" 2>/dev/null | head -n 1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' || echo "")
+    if [[ -n "$srv_ip" && -n "$resolved_ip" && "$srv_ip" != "$resolved_ip" ]]; then
+        echo -e "${RED}[警告] 域名 $domain 解析到的 IP ($resolved_ip) 与服务器公网 IP ($srv_ip) 不一致！${PLAIN}"
+        echo -e "${YELLOW}请确保已在域名提供商控制台添加 A 记录指向 $srv_ip，继续申请可能因无法完成 HTTP 验证而失败。${PLAIN}"
+        echo -e "是否强行继续？[y/N]: \c"
+        read -r continue_apply
+        if [[ ! "$continue_apply" =~ ^[Yy]$ ]]; then
+            return
+        fi
+    fi
+
+    echo -e "${CYAN}正在安装 acme.sh 自动化证书工具...${PLAIN}"
+    if ! command -v socat >/dev/null 2>&1; then
+        apt-get update -y >/dev/null 2>&1 && apt-get install -y socat >/dev/null 2>&1 || true
+    fi
+
+    if [[ ! -f ~/.acme.sh/acme.sh ]]; then
+        curl -fsSL https://get.acme.sh | sh -s email="admin@${domain}"
+    fi
+
+    echo -e "${CYAN}正在向 Let's Encrypt 申请 ECC (prime256v1) 权威证书...${PLAIN}"
+    # 释放 80 端口短暂用于 ACME 验证
+    systemctl stop "$SERVICE_NAME" >/dev/null 2>&1 || true
+
+    ~/.acme.sh/acme.sh --set-default-ca --server letsencrypt
+    if ~/.acme.sh/acme.sh --issue -d "$domain" --standalone --keylength ec-256 --force; then
+        mkdir -p /etc/mproxy
+        ~/.acme.sh/acme.sh --install-cert -d "$domain" --ecc \
+            --fullchain-file /etc/mproxy/cert.pem \
+            --key-file /etc/mproxy/key.pem \
+            --reloadcmd "systemctl restart mproxy"
+
+        echo -e "\n${GREEN}[成功] 权威 SSL 证书已成功申请并安装至 /etc/mproxy/！${PLAIN}"
+        echo -e "${GREEN}[成功] 已自动添加证书续期定时任务 (每天自动检查，到期前自动续约)。${PLAIN}"
+
+        systemctl start "$SERVICE_NAME"
+        echo -e "\n${CYAN}正在生成使用域名 ($domain) 的全新正规证书节点配置:${PLAIN}\n"
+        view_sub "$domain"
+    else
+        echo -e "\n${RED}[失败] 证书申请失败！请检查 80 端口是否被占用，以及域名 A 记录是否正确解析到当前服务器。${PLAIN}"
+        systemctl start "$SERVICE_NAME" >/dev/null 2>&1 || true
     fi
 }
 
@@ -185,7 +249,11 @@ case "$1" in
         exit 0
         ;;
     sub|link|links)
-        view_sub
+        view_sub "$2"
+        exit 0
+        ;;
+    cert|ssl)
+        apply_cert "$2"
         exit 0
         ;;
     config)
@@ -213,29 +281,32 @@ show_menu() {
     echo -e " 配置文件: ${CONFIG_FILE}"
     echo -e "----------------------------------------------------------"
     echo -e " ${GREEN}1.${PLAIN} 查看客户端节点链接与订阅配置 (sing-box/Clash/v2rayN)"
-    echo -e " ${GREEN}2.${PLAIN} 启动 mproxy"
-    echo -e " ${GREEN}3.${PLAIN} 停止 mproxy"
-    echo -e " ${GREEN}4.${PLAIN} 重启 mproxy"
+    echo -e " ${GREEN}2.${PLAIN} 一键申请并配置正规域名权威证书 (Let's Encrypt)"
     echo -e "----------------------------------------------------------"
-    echo -e " ${GREEN}5.${PLAIN} 查看实时运行日志"
-    echo -e " ${GREEN}6.${PLAIN} 修改服务端配置文件 (config.json)"
-    echo -e " ${GREEN}7.${PLAIN} 一键开启与优化 BBR 内核加速"
-    echo -e " ${RED}8.${PLAIN} 彻底卸载 mproxy"
+    echo -e " ${GREEN}3.${PLAIN} 启动 mproxy"
+    echo -e " ${GREEN}4.${PLAIN} 停止 mproxy"
+    echo -e " ${GREEN}5.${PLAIN} 重启 mproxy"
+    echo -e "----------------------------------------------------------"
+    echo -e " ${GREEN}6.${PLAIN} 查看实时运行日志"
+    echo -e " ${GREEN}7.${PLAIN} 修改服务端配置文件 (config.json)"
+    echo -e " ${GREEN}8.${PLAIN} 一键开启与优化 BBR 内核加速"
+    echo -e " ${RED}9.${PLAIN} 彻底卸载 mproxy"
     echo -e "----------------------------------------------------------"
     echo -e " ${CYAN}0.${PLAIN} 退出管理面板"
     echo -e "=========================================================="
-    echo -e "请输入选项 [0-8]: \c"
+    echo -e "请输入选项 [0-9]: \c"
     read -r num
 
     case "$num" in
         1) view_sub ;;
-        2) start_service ;;
-        3) stop_service ;;
-        4) restart_service ;;
-        5) view_log ;;
-        6) edit_config ;;
-        7) enable_bbr ;;
-        8) uninstall_mproxy ;;
+        2) apply_cert ;;
+        3) start_service ;;
+        4) stop_service ;;
+        5) restart_service ;;
+        6) view_log ;;
+        7) edit_config ;;
+        8) enable_bbr ;;
+        9) uninstall_mproxy ;;
         0) exit 0 ;;
         *) echo -e "${RED}[错误] 无效选项！${PLAIN}" ;;
     esac
