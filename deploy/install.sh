@@ -58,41 +58,38 @@ PROJECT_ROOT="$(dirname "$SCRIPT_DIR" 2>/dev/null || echo "")"
 
 echo -e "${GREEN}[3/7]${PLAIN} 部署 mproxy 核心二进制..."
 
-# 方案 A: 检查本地预编译文件
-if [[ -f "$PROJECT_ROOT/dist/mproxy-linux-${BIN_ARCH}" ]]; then
-    cp "$PROJECT_ROOT/dist/mproxy-linux-${BIN_ARCH}" /usr/local/bin/mproxy-core
+COMPILED=0
+
+# 优先策略：如果本地有源码且有 Go 环境，始终拉取依赖并编译最新版本
+if command -v go >/dev/null 2>&1 && [[ -f "$PROJECT_ROOT/main.go" ]]; then
+    echo -e "${CYAN}检测到本地 Go 环境，正在拉取依赖并编译最新源码...${PLAIN}"
+    (cd "$PROJECT_ROOT" && go mod tidy && go build -trimpath -ldflags="-s -w" -o /usr/local/bin/mproxy-core .)
     chmod +x /usr/local/bin/mproxy-core
-elif [[ -f "$PROJECT_ROOT/mproxy" ]]; then
-    cp "$PROJECT_ROOT/mproxy" /usr/local/bin/mproxy-core
-    chmod +x /usr/local/bin/mproxy-core
+    COMPILED=1
 fi
 
-# 方案 B: 远程从 GitHub 仓库下载预编译程序
-if [[ ! -f /usr/local/bin/mproxy-core || ! -s /usr/local/bin/mproxy-core ]]; then
-    echo -e "${CYAN}正在从 GitHub (${GITHUB_REPO}) 获取预编译程序...${PLAIN}"
-    RAW_BIN_URL="https://raw.githubusercontent.com/${GITHUB_REPO}/main/dist/mproxy-linux-${BIN_ARCH}"
-    RELEASE_BIN_URL="https://github.com/${GITHUB_REPO}/releases/latest/download/mproxy-linux-${BIN_ARCH}"
-    
-    if curl -fsSL -o /usr/local/bin/mproxy-core "$RAW_BIN_URL" 2>/dev/null; then
+# 如果未执行编译，则尝试从本地文件或 GitHub 下载
+if [[ $COMPILED -eq 0 ]]; then
+    if [[ -f "$PROJECT_ROOT/dist/mproxy-linux-${BIN_ARCH}" ]]; then
+        cp "$PROJECT_ROOT/dist/mproxy-linux-${BIN_ARCH}" /usr/local/bin/mproxy-core
         chmod +x /usr/local/bin/mproxy-core
-    elif curl -fsSL -o /usr/local/bin/mproxy-core "$RELEASE_BIN_URL" 2>/dev/null; then
-        chmod +x /usr/local/bin/mproxy-core
-    fi
-fi
-
-# 方案 C: 若二进制下载失败且本地有 Go 环境，拉取依赖并执行即时编译
-if [[ ! -f /usr/local/bin/mproxy-core || ! -s /usr/local/bin/mproxy-core ]]; then
-    if command -v go >/dev/null 2>&1 && [[ -f "$PROJECT_ROOT/main.go" ]]; then
-        echo -e "${CYAN}检测到 Go 环境，正在拉取依赖并编译源码...${PLAIN}"
-        (cd "$PROJECT_ROOT" && go mod tidy && go build -trimpath -ldflags="-s -w" -o /usr/local/bin/mproxy-core .)
-        chmod +x /usr/local/bin/mproxy-core
+    else
+        echo -e "${CYAN}正在从 GitHub (${GITHUB_REPO}) 获取预编译程序...${PLAIN}"
+        RAW_BIN_URL="https://raw.githubusercontent.com/${GITHUB_REPO}/main/dist/mproxy-linux-${BIN_ARCH}"
+        RELEASE_BIN_URL="https://github.com/${GITHUB_REPO}/releases/latest/download/mproxy-linux-${BIN_ARCH}"
+        
+        if curl -fsSL -o /usr/local/bin/mproxy-core "$RAW_BIN_URL" 2>/dev/null; then
+            chmod +x /usr/local/bin/mproxy-core
+        elif curl -fsSL -o /usr/local/bin/mproxy-core "$RELEASE_BIN_URL" 2>/dev/null; then
+            chmod +x /usr/local/bin/mproxy-core
+        fi
     fi
 fi
 
 # 校验核心二进制是否就绪
 if [[ ! -f /usr/local/bin/mproxy-core || ! -x /usr/local/bin/mproxy-core ]]; then
     echo -e "${RED}[错误]${PLAIN} 无法获取 mproxy-core 可执行文件！"
-    echo -e "请确认 GitHub 仓库 ${CYAN}https://github.com/${GITHUB_REPO}${PLAIN} 中已推送 dist/mproxy-linux-${BIN_ARCH}，或者运行: go mod tidy"
+    echo -e "若当前目录有源码，请执行: cd ~/mproxy && go mod tidy && go build -o /usr/local/bin/mproxy-core ."
     exit 1
 fi
 
