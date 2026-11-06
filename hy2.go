@@ -11,6 +11,7 @@ import (
 	"net"
 	"net/netip"
 	"strconv"
+	"sync"
 	"time"
 
 	"github.com/quic-go/quic-go"

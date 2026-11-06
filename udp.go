@@ -7,7 +7,6 @@ import (
 	"io"
 	"log/slog"
 	"net"
-	"net/netip"
 	"sync"
 	"sync/atomic"
 	"time"

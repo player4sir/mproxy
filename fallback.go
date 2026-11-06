@@ -4,11 +4,9 @@ import (
 	"bufio"
 	"context"
 	"errors"
-	"io"
 	"log/slog"
 	"net"
 	"net/http"
-	"strings"
 	"time"
 )
 

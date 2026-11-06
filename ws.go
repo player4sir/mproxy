@@ -62,6 +62,7 @@ func (c *wsConn) Read(p []byte) (int, error) {
 		}
 
 		fin := (b[0] & 0x80) != 0
+		_ = fin
 		opcode := b[0] & 0x0F
 		masked := (b[1] & 0x80) != 0
 		lenCode := int(b[1] & 0x7F)

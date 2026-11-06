@@ -33,7 +33,7 @@ func main() {
 			fmt.Fprintln(os.Stderr, "keygen error:", err)
 			os.Exit(1)
 		}
-		sid, _ := GenerateShortID()
+		sid := GenerateShortID()
 		fmt.Printf("PrivateKey: %s\nPublicKey:  %s\nShortID:    %s\n", priv, pub, sid)
 		return
 	}
