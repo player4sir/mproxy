@@ -237,9 +237,12 @@ func GenerateClientConfigs(cfg *Config, opt ExportOptions) string {
 				pw = l.Passwords[0]
 			}
 			sni := safeSNI(host)
-			// 注入 insecure=1 与 20000-50000 UDP 端口跳跃支持，粉碎晚高峰 QoS 限速
-			link := fmt.Sprintf("hysteria2://%s@%s:%d?sni=%s&insecure=1&mport=20000-50000#mproxy-Hysteria2-PortHopping", pw, host, port, sni)
-			sb.WriteString(fmt.Sprintf("[Hysteria 2 节点 (极速抗丢包 & 端口跳跃)]\n%s\n\n", link))
+			// 输出直连节点与端口跳跃节点
+			directLink := fmt.Sprintf("hysteria2://%s@%s:%d?sni=%s&insecure=1#mproxy-Hysteria2", pw, host, port, sni)
+			sb.WriteString(fmt.Sprintf("[Hysteria 2 节点 (直连极速抗丢包)]\n%s\n\n", directLink))
+
+			hopLink := fmt.Sprintf("hysteria2://%s@%s:%d?sni=%s&insecure=1&mport=20000-50000#mproxy-Hysteria2-PortHopping", pw, host, port, sni)
+			sb.WriteString(fmt.Sprintf("[Hysteria 2 端口跳跃节点 (20000-50000)]\n%s\n\n", hopLink))
 
 			clashProxies = append(clashProxies, map[string]any{
 				"name":             fmt.Sprintf("Hy2-Node-%d", i+1),

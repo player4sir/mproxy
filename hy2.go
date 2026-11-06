@@ -209,9 +209,7 @@ func (h *hy2Handler) handleSession(ctx context.Context, sess quic.Connection) {
 
 	// 官方 Hysteria 2 认证成功规范：服务端发送符合 RFC 9114 / RFC 9204 规范的标准 HTTP/3 响应帧
 	// 包含 :status: 233, hysteria-udp: true, hysteria-cc-rx: auto
-	hy2OKResp := []byte{
-		0x01,       // HTTP/3 Frame Type: HEADERS
-		0x32,       // Payload 长度 (50 字节)
+	qpackPayload := []byte{
 		0x00, 0x00, // QPACK Prefix: Required Insert Count = 0, Base = 0
 
 		// Header 1: :status = 233 (RFC 9204 QPACK Name Reference: 0x5f, Index=15+48=63 (:status), ValLen=3)
@@ -229,7 +227,11 @@ func (h *hy2Handler) handleSession(ctx context.Context, sess quic.Connection) {
 		0x04,
 		'a', 'u', 't', 'o',
 	}
-	_, _ = authStream.Write(hy2OKResp)
+	var frameHdr [2]byte
+	frameHdr[0] = 0x01 // HTTP/3 Frame Type: HEADERS
+	frameHdr[1] = byte(len(qpackPayload))
+	_, _ = authStream.Write(frameHdr[:])
+	_, _ = authStream.Write(qpackPayload)
 	authStream.Close()
 
 	// 2. 启动 UDP 数据报（QUIC Datagram）中继处理
