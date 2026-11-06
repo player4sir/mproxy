@@ -2,12 +2,9 @@ package main
 
 import (
 	"bufio"
-	"bytes"
 	"context"
-	"crypto/subtle"
 	"errors"
 	"fmt"
-	"io"
 	"log/slog"
 	"net"
 	"strings"

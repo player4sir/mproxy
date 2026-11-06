@@ -5,12 +5,11 @@ import (
 	"crypto/subtle"
 	"crypto/tls"
 	"encoding/binary"
-	"errors"
 	"fmt"
 	"io"
 	"log/slog"
 	"net"
-	"sync"
+	"net/netip"
 	"time"
 
 	"github.com/quic-go/quic-go"
@@ -140,6 +139,20 @@ func netIPToAddr(ip net.IP) netip.Addr {
 	return netip.Addr{}
 }
 
+// quicStreamConn 将 quic.Stream 包装为标准的 net.Conn 接口
+type quicStreamConn struct {
+	quic.Stream
+	sess quic.Connection
+}
+
+func (c *quicStreamConn) LocalAddr() net.Addr {
+	return c.sess.LocalAddr()
+}
+
+func (c *quicStreamConn) RemoteAddr() net.Addr {
+	return c.sess.RemoteAddr()
+}
+
 // handleSession 处理单个客户端 QUIC 握手会话
 func (h *hy2Handler) handleSession(ctx context.Context, sess quic.Connection) {
 	defer sess.CloseWithError(0x00, "session closed")
@@ -190,12 +203,12 @@ func (h *hy2Handler) handleSession(ctx context.Context, sess quic.Connection) {
 		if err != nil {
 			return
 		}
-		go h.handleTCPStream(ctx, stream)
+		go h.handleTCPStream(ctx, sess, stream)
 	}
 }
 
 // handleTCPStream 处理 QUIC Stream 代理的 TCP 流量
-func (h *hy2Handler) handleTCPStream(ctx context.Context, stream quic.Stream) {
+func (h *hy2Handler) handleTCPStream(ctx context.Context, sess quic.Connection, stream quic.Stream) {
 	defer stream.Close()
 
 	// Stream 头部为目标地址: [ATYP + ADDR + PORT]
@@ -213,8 +226,9 @@ func (h *hy2Handler) handleTCPStream(ctx context.Context, stream quic.Stream) {
 	}
 	defer up.Close()
 
-	// 在 quic.Stream 与真实 TCP 连接间双向转发
-	relay(stream, up, h.lim.IdleTimeout.Duration)
+	// 将 quic.Stream 包装为 net.Conn 后传入 relay
+	streamConn := &quicStreamConn{Stream: stream, sess: sess}
+	relay(streamConn, up, h.lim.IdleTimeout.Duration)
 }
 
 // handleDatagrams 处理基于 RFC 9221 QUIC Datagram 的 UDP 中继

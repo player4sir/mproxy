@@ -13,7 +13,6 @@ import (
 	"net/netip"
 	"strings"
 	"sync"
-	"time"
 )
 
 var (
