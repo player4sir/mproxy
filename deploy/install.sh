@@ -80,11 +80,11 @@ if [[ ! -f /usr/local/bin/mproxy-core || ! -s /usr/local/bin/mproxy-core ]]; the
     fi
 fi
 
-# 方案 C: 若二进制下载失败且本地有 Go 环境，执行即时编译
+# 方案 C: 若二进制下载失败且本地有 Go 环境，拉取依赖并执行即时编译
 if [[ ! -f /usr/local/bin/mproxy-core || ! -s /usr/local/bin/mproxy-core ]]; then
     if command -v go >/dev/null 2>&1 && [[ -f "$PROJECT_ROOT/main.go" ]]; then
-        echo -e "${CYAN}正在通过本地 Go 环境编译...${PLAIN}"
-        (cd "$PROJECT_ROOT" && go build -trimpath -ldflags="-s -w" -o /usr/local/bin/mproxy-core .)
+        echo -e "${CYAN}检测到 Go 环境，正在拉取依赖并编译源码...${PLAIN}"
+        (cd "$PROJECT_ROOT" && go mod tidy && go build -trimpath -ldflags="-s -w" -o /usr/local/bin/mproxy-core .)
         chmod +x /usr/local/bin/mproxy-core
     fi
 fi
@@ -92,7 +92,7 @@ fi
 # 校验核心二进制是否就绪
 if [[ ! -f /usr/local/bin/mproxy-core || ! -x /usr/local/bin/mproxy-core ]]; then
     echo -e "${RED}[错误]${PLAIN} 无法获取 mproxy-core 可执行文件！"
-    echo -e "请确认 GitHub 仓库 ${CYAN}https://github.com/${GITHUB_REPO}${PLAIN} 中已推送 dist/mproxy-linux-${BIN_ARCH}"
+    echo -e "请确认 GitHub 仓库 ${CYAN}https://github.com/${GITHUB_REPO}${PLAIN} 中已推送 dist/mproxy-linux-${BIN_ARCH}，或者运行: go mod tidy"
     exit 1
 fi
 
