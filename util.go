@@ -59,7 +59,7 @@ func readAddr(r io.Reader) (host string, port int, err error) {
 		return
 	}
 	port = int(binary.BigEndian.Uint16(p[:]))
-	if port <= 0 || port > 65535 {
+	if port < 0 || port > 65535 {
 		return "", 0, errBadAddr
 	}
 	return
@@ -67,7 +67,7 @@ func readAddr(r io.Reader) (host string, port int, err error) {
 
 // writeAddr 将 host:port 序列化为 SOCKS5 / Trojan 格式的地址字节流
 func writeAddr(buf []byte, host string, port int) ([]byte, error) {
-	if port <= 0 || port > 65535 {
+	if port < 0 || port > 65535 {
 		return nil, fmt.Errorf("invalid port %d", port)
 	}
 	var res []byte
