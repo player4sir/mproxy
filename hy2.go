@@ -737,6 +737,34 @@ func qpackStaticNameVal(idx int) (string, string) {
 		return ":scheme", "http"
 	case 23:
 		return ":scheme", "https"
+	case 24:
+		return ":status", "103"
+	case 25:
+		return ":status", "200"
+	case 26:
+		return ":status", "304"
+	case 27:
+		return ":status", "404"
+	case 28:
+		return ":status", "503"
+	case 63:
+		return ":status", "100"
+	case 64:
+		return ":status", "204"
+	case 65:
+		return ":status", "206"
+	case 66:
+		return ":status", "302"
+	case 67:
+		return ":status", "400"
+	case 68:
+		return ":status", "403"
+	case 69:
+		return ":status", "421"
+	case 70:
+		return ":status", "425"
+	case 71:
+		return ":status", "500"
 	default:
 		return "", ""
 	}
