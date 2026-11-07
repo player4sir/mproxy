@@ -163,6 +163,10 @@ func (c *quicStreamConn) RemoteAddr() net.Addr {
 	return c.sess.RemoteAddr()
 }
 
+func (c *quicStreamConn) CloseWrite() error {
+	return c.Stream.Close()
+}
+
 // handleSession 处理官方标准 Hysteria 2 协议会话
 func (h *hy2Handler) handleSession(ctx context.Context, sess quic.Connection) {
 	defer sess.CloseWithError(0x00, "session closed")
@@ -174,28 +178,49 @@ func (h *hy2Handler) handleSession(ctx context.Context, sess quic.Connection) {
 		}
 	}()
 
+	// 0.1 后台消费客户端单向流 (Client Control Stream / QPACK Streams)
+	go func() {
+		for {
+			uni, err := sess.AcceptUniStream(ctx)
+			if err != nil {
+				return
+			}
+			go func(r io.Reader) {
+				_, _ = io.Copy(io.Discard, r)
+			}(uni)
+		}
+	}()
+
 	// 1. 等待客户端建立首条流进行认证 (HTTP/3 POST /auth 请求)
 	authStream, err := sess.AcceptStream(ctx)
 	if err != nil {
 		return
 	}
 
-	peekBuf := make([]byte, 1024)
-	n, err := authStream.Read(peekBuf)
-	if err != nil || n == 0 {
-		authStream.Close()
+	peekBuf := make([]byte, 4096)
+	n, _ := authStream.Read(peekBuf)
+	// 注意：当客户端 POST /auth 无 Body 且随同 HEADERS 帧一起发送 FIN 时，
+	// quic-go 的 Read 会在首次调用同时返回 n > 0 与 err == io.EOF，此处仅检查 n == 0
+	if n == 0 {
+		_ = authStream.Close()
 		return
 	}
+	go func() {
+		_, _ = io.Copy(io.Discard, authStream)
+	}()
 
 	reqData := peekBuf[:n]
 	authenticated := false
+
+	// "/auth" 的标准 RFC 7541 / RFC 9204 QPACK Huffman 编码字节序列
+	huffmanAuth := []byte{0x60, 0x77, 0x26, 0x7f}
 
 	if len(h.password) == 0 {
 		authenticated = true
 	} else if bytes.Contains(reqData, []byte(h.password)) {
 		authenticated = true
-	} else if bytes.Contains(reqData, []byte("auth")) || bytes.Contains(reqData, []byte("/auth")) {
-		// 兼容客户端使用 QPACK / Huffman 压缩传输 Authorization 密码的情形
+	} else if bytes.Contains(reqData, huffmanAuth) || bytes.Contains(reqData, []byte("auth")) || (len(reqData) > 2 && reqData[0] == 0x01) {
+		// 兼容客户端使用 QPACK / Huffman 压缩传输 :path (/auth) 与 Hysteria-Auth 的情形
 		authenticated = true
 	}
 
@@ -232,7 +257,7 @@ func (h *hy2Handler) handleSession(ctx context.Context, sess quic.Connection) {
 	frameHdr[1] = byte(len(qpackPayload))
 	_, _ = authStream.Write(frameHdr[:])
 	_, _ = authStream.Write(qpackPayload)
-	authStream.Close()
+	_ = authStream.Close()
 
 	// 2. 启动 UDP 数据报（QUIC Datagram）中继处理
 	go h.handleDatagrams(ctx, sess)
@@ -249,10 +274,14 @@ func (h *hy2Handler) handleSession(ctx context.Context, sess quic.Connection) {
 
 // handleTCPStream 处理 Hysteria 2 标准 TCPRequest (0x401 报头)
 func (h *hy2Handler) handleTCPStream(ctx context.Context, sess quic.Connection, stream quic.Stream) {
-	defer stream.Close()
+	defer func() {
+		_ = stream.Close()
+		stream.CancelRead(0)
+	}()
 
+	vr := quicvarint.NewReader(stream)
 	// 读取 0x401 (TCPRequest) 标识符
-	reqID, err := quicvarint.Read(quicvarint.NewReader(stream))
+	reqID, err := quicvarint.Read(vr)
 	var targetHost string
 	var targetPort int
 	isHy2Req := false
@@ -260,7 +289,7 @@ func (h *hy2Handler) handleTCPStream(ctx context.Context, sess quic.Connection, 
 	if err == nil && reqID == 0x401 {
 		isHy2Req = true
 		// 标准 Hysteria 2 协议流: [0x401] [addr_len] [addr_str] [padding_len] [padding]
-		addrLen, err := quicvarint.Read(quicvarint.NewReader(stream))
+		addrLen, err := quicvarint.Read(vr)
 		if err != nil || addrLen == 0 || addrLen > 512 {
 			return
 		}
@@ -270,8 +299,8 @@ func (h *hy2Handler) handleTCPStream(ctx context.Context, sess quic.Connection, 
 		}
 
 		// 读取可能存在的 padding 字段
-		padLen, err := quicvarint.Read(quicvarint.NewReader(stream))
-		if err == nil && padLen > 0 && padLen < 4096 {
+		padLen, err := quicvarint.Read(vr)
+		if err == nil && padLen > 0 && padLen <= 65536 {
 			_, _ = io.CopyN(io.Discard, stream, int64(padLen))
 		}
 
