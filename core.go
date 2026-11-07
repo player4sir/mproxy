@@ -259,10 +259,42 @@ func (o *Outbound) ResolveTarget(ctx context.Context, host string) ([]net.IP, er
 }
 
 func (o *Outbound) Dial(ctx context.Context, host string, port int) (net.Conn, error) {
-	return o.d.DialContext(ctx, "tcp", hostPort(host, port))
+	// 优先使用带 2 分钟 TTL 的内存 DNS 缓存解析目标 IP，消除每次 TCP 连接重复 DNS 查询 (省去 15~60ms)
+	ips, err := o.ResolveTarget(ctx, host)
+	if err != nil {
+		return o.d.DialContext(ctx, "tcp", hostPort(host, port))
+	}
+	var lastErr error
+	for _, ip := range ips {
+		c, err := o.d.DialContext(ctx, "tcp", hostPort(ip.String(), port))
+		if err == nil {
+			return c, nil
+		}
+		lastErr = err
+	}
+	return nil, lastErr
 }
 
-// ---------- 高性能双向转发管道 ----------
+// ---------- 高性能双向转发管道与缓冲池 ----------
+
+var brPool = sync.Pool{
+	New: func() any {
+		return bufio.NewReaderSize(nil, 8192)
+	},
+}
+
+func acquireReader(r io.Reader) *bufio.Reader {
+	br := brPool.Get().(*bufio.Reader)
+	br.Reset(r)
+	return br
+}
+
+func releaseReader(br *bufio.Reader) {
+	if br != nil {
+		br.Reset(nil)
+		brPool.Put(br)
+	}
+}
 
 var bufPool = sync.Pool{
 	New: func() any {

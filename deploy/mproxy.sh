@@ -96,6 +96,17 @@ view_sub() {
     fi
     local host_arg="$1"
     if [[ -z "$host_arg" ]]; then
+        # 优先读取已绑定的正规证书域名，或从 /etc/mproxy/cert.pem 自动提取非自签域名
+        if [[ -f /etc/mproxy/domain ]]; then
+            host_arg=$(cat /etc/mproxy/domain | tr -d ' \r\n')
+        elif [[ -f /etc/mproxy/cert.pem ]] && command -v openssl >/dev/null 2>&1; then
+            local cert_cn=$(openssl x509 -in /etc/mproxy/cert.pem -noout -subject 2>/dev/null | sed -n 's/.*CN[[:space:]]*=[[:space:]]*\([^,/]*\).*/\1/p')
+            if [[ -n "$cert_cn" && "$cert_cn" != "www.microsoft.com" && "$cert_cn" != "localhost" ]]; then
+                host_arg="$cert_cn"
+            fi
+        fi
+    fi
+    if [[ -z "$host_arg" ]]; then
         host_arg=$(curl -s4 --max-time 3 ip.sb || curl -s4 --max-time 3 ifconfig.me || echo "YOUR_SERVER_IP")
     fi
     echo -e "${CYAN}正在生成节点与订阅配置 (地址: $host_arg)...${PLAIN}\n"
@@ -164,6 +175,7 @@ apply_cert() {
     ~/.acme.sh/acme.sh --set-default-ca --server letsencrypt
     if ~/.acme.sh/acme.sh --issue -d "$domain" --standalone --keylength ec-256 --force; then
         mkdir -p /etc/mproxy
+        echo "$domain" > /etc/mproxy/domain
         ~/.acme.sh/acme.sh --install-cert -d "$domain" --ecc \
             --fullchain-file /etc/mproxy/cert.pem \
             --key-file /etc/mproxy/key.pem \
@@ -235,6 +247,37 @@ manage_port_hop() {
     fi
 }
 
+# 一键从 GitHub 拉取最新代码并编译更新
+update_mproxy() {
+    check_root
+    echo -e "${CYAN}正在从 GitHub 拉取最新源码并编译更新 mproxy...${PLAIN}"
+    if [[ -x /usr/local/go/bin/go ]]; then
+        export PATH=$PATH:/usr/local/go/bin
+    fi
+    if ! command -v go >/dev/null 2>&1; then
+        echo -e "${RED}[错误] 未检测到 Go 编译环境，正在调用在线安装器更新...${PLAIN}"
+        bash <(curl -fsSL https://raw.githubusercontent.com/player4sir/mproxy/main/deploy/install.sh)
+        return
+    fi
+
+    local src_dir="/tmp/mproxy"
+    if [[ -d "$src_dir/.git" ]]; then
+        (cd "$src_dir" && git fetch --all && git reset --hard origin/main)
+    else
+        rm -rf "$src_dir"
+        git clone --depth=1 https://github.com/player4sir/mproxy.git "$src_dir"
+    fi
+
+    (cd "$src_dir" && go build -trimpath -ldflags="-s -w" -o "$BIN_CORE" .)
+    chmod +x "$BIN_CORE"
+    if [[ -f "$src_dir/deploy/mproxy.sh" ]]; then
+        cp "$src_dir/deploy/mproxy.sh" /usr/local/bin/mproxy
+        chmod +x /usr/local/bin/mproxy
+    fi
+    systemctl restart "$SERVICE_NAME"
+    echo -e "${GREEN}[成功] mproxy 已更新至最新版本并成功重启！${PLAIN}"
+}
+
 # 卸载 mproxy
 uninstall_mproxy() {
     check_root
@@ -303,6 +346,10 @@ case "$1" in
         enable_bbr
         exit 0
         ;;
+    update|upgrade)
+        update_mproxy
+        exit 0
+        ;;
     uninstall)
         uninstall_mproxy
         exit 0
@@ -331,11 +378,12 @@ show_menu() {
     echo -e " ${GREEN}8.${PLAIN} 查看实时运行日志"
     echo -e " ${GREEN}9.${PLAIN} 修改服务端配置文件 (config.json)"
     echo -e " ${GREEN}10.${PLAIN} 一键开启与优化 BBR 内核加速"
-    echo -e " ${RED}11.${PLAIN} 彻底卸载 mproxy"
+    echo -e " ${GREEN}11.${PLAIN} 一键拉取 GitHub 最新源码更新 (mproxy update)"
+    echo -e " ${RED}12.${PLAIN} 彻底卸载 mproxy"
     echo -e "----------------------------------------------------------"
     echo -e " ${CYAN}0.${PLAIN} 退出管理面板"
     echo -e "=========================================================="
-    echo -e "请输入选项 [0-11]: \c"
+    echo -e "请输入选项 [0-12]: \c"
     read -r num
 
     case "$num" in
@@ -349,7 +397,8 @@ show_menu() {
         8) view_log ;;
         9) edit_config ;;
         10) enable_bbr ;;
-        11) uninstall_mproxy ;;
+        11) update_mproxy ;;
+        12) uninstall_mproxy ;;
         0) exit 0 ;;
         *) echo -e "${RED}[错误] 无效选项！${PLAIN}" ;;
     esac

@@ -253,11 +253,52 @@ func UpgradeWebSocket(raw net.Conn, br *bufio.Reader, cfg *WSConfig) (net.Conn, 
 		}
 	}
 
+	// 4.5 支持 Xray / v2rayN / sing-box 的 WebSocket 0-RTT Early Data (?ed=2048)
+	// 客户端通过 Sec-WebSocket-Protocol 标头携带 Base64 编码的首包数据，省去 1 个跨洋握手 RTT
+	var earlyData []byte
+	var echoProtocol string
+	if protoHdr := req.Header.Get("Sec-WebSocket-Protocol"); protoHdr != "" {
+		// 处理可能包含逗号分隔的多个子协议或直接的 Base64 载荷
+		for _, part := range strings.Split(protoHdr, ",") {
+			token := strings.TrimSpace(part)
+			if token == "" {
+				continue
+			}
+			// 依次尝试 RawURLEncoding, URLEncoding, StdEncoding, RawStdEncoding
+			if decoded, err := base64.RawURLEncoding.DecodeString(token); err == nil && len(decoded) > 0 {
+				earlyData = decoded
+				echoProtocol = token
+				break
+			} else if decoded, err := base64.URLEncoding.DecodeString(token); err == nil && len(decoded) > 0 {
+				earlyData = decoded
+				echoProtocol = token
+				break
+			} else if decoded, err := base64.StdEncoding.DecodeString(token); err == nil && len(decoded) > 0 {
+				earlyData = decoded
+				echoProtocol = token
+				break
+			} else if decoded, err := base64.RawStdEncoding.DecodeString(token); err == nil && len(decoded) > 0 {
+				earlyData = decoded
+				echoProtocol = token
+				break
+			}
+		}
+	}
+
 	// 5. 响应 101 Switching Protocols
-	resp := fmt.Sprintf("HTTP/1.1 101 Switching Protocols\r\n"+
-		"Upgrade: websocket\r\n"+
-		"Connection: Upgrade\r\n"+
-		"Sec-WebSocket-Accept: %s\r\n\r\n", accept)
+	var resp string
+	if echoProtocol != "" {
+		resp = fmt.Sprintf("HTTP/1.1 101 Switching Protocols\r\n"+
+			"Upgrade: websocket\r\n"+
+			"Connection: Upgrade\r\n"+
+			"Sec-WebSocket-Accept: %s\r\n"+
+			"Sec-WebSocket-Protocol: %s\r\n\r\n", accept, echoProtocol)
+	} else {
+		resp = fmt.Sprintf("HTTP/1.1 101 Switching Protocols\r\n"+
+			"Upgrade: websocket\r\n"+
+			"Connection: Upgrade\r\n"+
+			"Sec-WebSocket-Accept: %s\r\n\r\n", accept)
+	}
 
 	if _, err := raw.Write([]byte(resp)); err != nil {
 		return nil, err
@@ -272,6 +313,7 @@ func UpgradeWebSocket(raw net.Conn, br *bufio.Reader, cfg *WSConfig) (net.Conn, 
 		Conn:       raw,
 		r:          br,
 		remoteAddr: resolvedRemote,
+		readLeft:   earlyData,
 		maxLen:     maxLen,
 	}, nil
 }

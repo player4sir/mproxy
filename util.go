@@ -142,6 +142,13 @@ func ioReadFull(r io.Reader, b []byte) (int, error) {
 	return io.ReadFull(r, b)
 }
 
+func containsFold(s, substr string) bool {
+	if len(substr) > len(s) {
+		return false
+	}
+	return bytes.Contains(bytes.ToLower([]byte(s)), bytes.ToLower([]byte(substr)))
+}
+
 // buildProxyProtocolV1Header 构造 PROXY protocol v1 头部（ASCII 字符串），
 // 将真实客户端 IP/Port 透传给后端 Nginx/Caddy，防止日志全为 127.0.0.1
 func buildProxyProtocolV1Header(src, dst net.Addr) []byte {

@@ -94,7 +94,38 @@ func newVLESSHandler(lc ListenerConfig, out *Outbound, g *Guard, lim Limits, udp
 func (h *vlessHandler) handle(ctx context.Context, c net.Conn) {
 	ip := addrOf(c)
 	_ = c.SetDeadline(time.Now().Add(h.lim.HandshakeTimeout.Duration))
-	br := bufio.NewReaderSize(c, 8192)
+	br := acquireReader(c)
+	defer releaseReader(br)
+
+	// 0. 协议嗅探与单端口智能复用（443 端口同时支持 VLESS-TLS、VLESS-WSS 与伪装站回落）
+	if peek1, err := br.Peek(1); err == nil && peek1[0] != 0x00 {
+		// 检查是否为 HTTP / WebSocket 升级请求 (例如 "GET /...")
+		if peek4, err := br.Peek(4); err == nil && string(peek4) == "GET " {
+			if peekHdr, _ := br.Peek(br.Buffered()); len(peekHdr) > 0 {
+				hdrStr := string(peekHdr)
+				if containsFold(hdrStr, "upgrade: websocket") {
+					wsConn, err := UpgradeWebSocket(c, br, &WSConfig{})
+					if err != nil {
+						h.guard.Fail(ip)
+						return
+					}
+					h.handle(ctx, wsConn)
+					return
+				}
+			}
+		}
+		// 非 VLESS 且非 WebSocket（例如普通浏览器直接访问 https://aws.mzstd.xyz），零篡改透明回落到伪装站
+		if h.fallback != "" {
+			d := net.Dialer{Timeout: 3 * time.Second}
+			if fb, err := d.DialContext(ctx, "tcp", h.fallback); err == nil {
+				_ = c.SetDeadline(time.Time{})
+				relay(&bufConn{Conn: c, r: br}, fb, h.lim.IdleTimeout.Duration)
+				return
+			}
+		}
+		h.guard.Fail(ip)
+		return
+	}
 
 	// 1. 读取 VLESS 版本 (1B)
 	ver, err := br.ReadByte()

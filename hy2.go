@@ -88,9 +88,22 @@ func StartHy2Listener(ctx context.Context, lc ListenerConfig, out *Outbound, g *
 		Allow0RTT:                      true,
 	}
 
-	ln, err := quic.ListenAddr(lc.Listen, tlsCfg, quicCfg)
+	// 手动创建 UDP 套接字并拉满内核读写缓冲区 (7MB)，防止 4K/8K 高速突发丢包
+	uAddr, err := net.ResolveUDPAddr("udp", lc.Listen)
+	if err != nil {
+		return nil, fmt.Errorf("resolve hy2 udp %s: %w", lc.Listen, err)
+	}
+	uConn, err := net.ListenUDP("udp", uAddr)
 	if err != nil {
 		return nil, fmt.Errorf("listen hy2 udp %s: %w", lc.Listen, err)
+	}
+	_ = uConn.SetReadBuffer(7 * 1024 * 1024)
+	_ = uConn.SetWriteBuffer(7 * 1024 * 1024)
+
+	ln, err := quic.Listen(uConn, tlsCfg, quicCfg)
+	if err != nil {
+		_ = uConn.Close()
+		return nil, fmt.Errorf("quic listen hy2 %s: %w", lc.Listen, err)
 	}
 	slog.Info("listening hy2 (quic/udp)", "addr", lc.Listen)
 

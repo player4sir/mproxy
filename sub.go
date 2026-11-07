@@ -2,11 +2,14 @@ package main
 
 import (
 	"crypto/ecdh"
+	"crypto/x509"
 	"encoding/base64"
 	"encoding/json"
+	"encoding/pem"
 	"fmt"
 	"net"
 	"net/url"
+	"os"
 	"strconv"
 	"strings"
 )
@@ -21,6 +24,33 @@ func safeSNI(host string) string {
 		return "www.microsoft.com"
 	}
 	return host
+}
+
+// isTrustedCertForHost 检测给定证书是否为受信任权威 CA 签发（非自签名）且匹配当前域名
+func isTrustedCertForHost(certPath, host string) bool {
+	if certPath == "" || host == "" || net.ParseIP(host) != nil || host == "YOUR_SERVER_IP" {
+		return false
+	}
+	b, err := os.ReadFile(certPath)
+	if err != nil {
+		return false
+	}
+	block, _ := pem.Decode(b)
+	if block == nil {
+		return false
+	}
+	cert, err := x509.ParseCertificate(block.Bytes)
+	if err != nil {
+		return false
+	}
+	// 自签名证书 Issuer 与 Subject 相同
+	if cert.Issuer.String() == cert.Subject.String() {
+		return false
+	}
+	if err := cert.VerifyHostname(host); err != nil {
+		return false
+	}
+	return true
 }
 
 // GenerateClientConfigs 自动生成全平台免配置直接连通的订阅链接与客户端配置
@@ -38,8 +68,9 @@ func GenerateClientConfigs(cfg *Config, opt ExportOptions) string {
 	sb.WriteString("====================================================================\n\n")
 
 	sb.WriteString("----------------- [1] 一键导入通用节点链接 (Universal Links) -----------------\n")
-	sb.WriteString("已自动注入免证书报错参数 (insecure/allowInsecure)，一键导入直接连通:\n\n")
+	sb.WriteString("已自动完成证书校验与 0-RTT Early Data 加速注入，一键导入直接连通:\n\n")
 
+	var rawLinks []string
 	var clashProxies []map[string]any
 	var singboxOutbounds []map[string]any
 
@@ -84,12 +115,14 @@ func GenerateClientConfigs(cfg *Config, opt ExportOptions) string {
 				link := fmt.Sprintf("vless://%s@%s:%d?encryption=none&security=reality&sni=%s&fp=chrome&pbk=%s&sid=%s&type=tcp#mproxy-VLESS-Reality",
 					uuid, host, port, sni, pubKey, sid)
 				sb.WriteString(fmt.Sprintf("[VLESS Reality 节点 (免域名强抗封锁)]\n%s\n\n", link))
+				rawLinks = append(rawLinks, link)
 
 				// 同时导出标准 VLESS + TLS 节点（全平台 100% 极速通畅，免证书配置）
 				tlsSNI := safeSNI(host)
 				tlsLink := fmt.Sprintf("vless://%s@%s:%d?encryption=none&security=tls&allowInsecure=1&sni=%s&type=tcp#mproxy-VLESS-TLS",
 					uuid, host, port, tlsSNI)
 				sb.WriteString(fmt.Sprintf("[VLESS TLS 节点 (全平台秒通)]\n%s\n\n", tlsLink))
+				rawLinks = append(rawLinks, tlsLink)
 
 				clashProxies = append(clashProxies, map[string]any{
 					"name":               fmt.Sprintf("VLESS-Reality-%d", i+1),
@@ -130,24 +163,34 @@ func GenerateClientConfigs(cfg *Config, opt ExportOptions) string {
 				})
 
 			} else if l.Transport != nil && l.Transport.Type == "ws" {
-				// VLESS + WebSocket (专供 CDN 中转与普通 HTTP 代理)
+				// VLESS + WebSocket (专供 CDN 中转与普通 HTTP 代理，默认附加 ?ed=2048 开启 0-RTT Early Data)
 				domain := host
 				wsPath := l.Transport.WS.Path
 				if wsPath == "" {
 					wsPath = "/vless-ws"
 				}
+				wsPathWithED := wsPath
+				if !strings.Contains(wsPathWithED, "ed=") {
+					wsPathWithED = wsPath + "?ed=2048"
+				}
 
-				// 关键修复：明文端口自动输出 security=none，带证书端口注入 allowInsecure=1
 				secParam := "none"
 				isTLS := false
+				skipVerify := true
 				if l.TLS != nil {
-					secParam = "tls&allowInsecure=1"
 					isTLS = true
+					if isTrustedCertForHost(l.TLS.Cert, host) {
+						secParam = "tls"
+						skipVerify = false
+					} else {
+						secParam = "tls&allowInsecure=1"
+					}
 				}
 
 				link := fmt.Sprintf("vless://%s@%s:%d?encryption=none&security=%s&type=ws&host=%s&path=%s#mproxy-VLESS-WS-CDN",
-					uuid, host, port, secParam, domain, url.QueryEscape(wsPath))
-				sb.WriteString(fmt.Sprintf("[VLESS WebSocket CDN 节点]\n%s\n\n", link))
+					uuid, host, port, secParam, domain, url.QueryEscape(wsPathWithED))
+				sb.WriteString(fmt.Sprintf("[VLESS WebSocket CDN 节点 (0-RTT 极速)]\n%s\n\n", link))
+				rawLinks = append(rawLinks, link)
 
 				clashNode := map[string]any{
 					"name":       fmt.Sprintf("VLESS-WS-CDN-%d", i+1),
@@ -160,14 +203,16 @@ func GenerateClientConfigs(cfg *Config, opt ExportOptions) string {
 					"udp":        true,
 					"servername": domain,
 					"ws-opts": map[string]any{
-						"path": wsPath,
+						"path":                wsPath,
+						"max-early-data":      2048,
+						"early-data-header-name": "Sec-WebSocket-Protocol",
 						"headers": map[string]any{
 							"Host": domain,
 						},
 					},
 				}
 				if isTLS {
-					clashNode["skip-cert-verify"] = true
+					clashNode["skip-cert-verify"] = skipVerify
 				}
 				clashProxies = append(clashProxies, clashNode)
 
@@ -178,8 +223,10 @@ func GenerateClientConfigs(cfg *Config, opt ExportOptions) string {
 					"server_port": port,
 					"uuid":        uuid,
 					"transport": map[string]any{
-						"type": "ws",
-						"path": wsPath,
+						"type":                "ws",
+						"path":                wsPath,
+						"max_early_data":      2048,
+						"early_data_header_name": "Sec-WebSocket-Protocol",
 						"headers": map[string]any{
 							"Host": domain,
 						},
@@ -189,17 +236,29 @@ func GenerateClientConfigs(cfg *Config, opt ExportOptions) string {
 					sbNode["tls"] = map[string]any{
 						"enabled":     true,
 						"server_name": domain,
-						"insecure":    true,
+						"insecure":    skipVerify,
 					}
 				}
 				singboxOutbounds = append(singboxOutbounds, sbNode)
 
 			} else if l.TLS != nil {
-				// VLESS + TLS
+				// VLESS + TLS (443 端口同时支持直连 VLESS-TLS 与 Cloudflare 443 WSS)
 				sni := safeSNI(host)
-				link := fmt.Sprintf("vless://%s@%s:%d?encryption=none&security=tls&allowInsecure=1&sni=%s&type=tcp#mproxy-VLESS-TLS",
-					uuid, host, port, sni)
+				trusted := isTrustedCertForHost(l.TLS.Cert, host)
+				insecParam := "&allowInsecure=1"
+				if trusted {
+					insecParam = ""
+				}
+				link := fmt.Sprintf("vless://%s@%s:%d?encryption=none&security=tls%s&sni=%s&fp=chrome&type=tcp#mproxy-VLESS-TLS",
+					uuid, host, port, insecParam, sni)
 				sb.WriteString(fmt.Sprintf("[VLESS TLS 节点]\n%s\n\n", link))
+				rawLinks = append(rawLinks, link)
+
+				// 额外输出 443 单端口复用的 VLESS-WSS 节点（可供开启 Cloudflare 小黄云 443 端口直接使用）
+				wssLink := fmt.Sprintf("vless://%s@%s:%d?encryption=none&security=tls%s&sni=%s&fp=chrome&type=ws&host=%s&path=%s#mproxy-VLESS-WSS-443",
+					uuid, host, port, insecParam, sni, sni, url.QueryEscape("/vless-ws?ed=2048"))
+				sb.WriteString(fmt.Sprintf("[VLESS WSS 443 节点 (支持开启 Cloudflare 橙色云)]\n%s\n\n", wssLink))
+				rawLinks = append(rawLinks, wssLink)
 
 				clashProxies = append(clashProxies, map[string]any{
 					"name":             fmt.Sprintf("VLESS-TLS-%d", i+1),
@@ -211,7 +270,7 @@ func GenerateClientConfigs(cfg *Config, opt ExportOptions) string {
 					"tls":              true,
 					"udp":              true,
 					"servername":       sni,
-					"skip-cert-verify": true,
+					"skip-cert-verify": !trusted,
 				})
 
 				singboxOutbounds = append(singboxOutbounds, map[string]any{
@@ -223,7 +282,7 @@ func GenerateClientConfigs(cfg *Config, opt ExportOptions) string {
 					"tls": map[string]any{
 						"enabled":     true,
 						"server_name": sni,
-						"insecure":    true,
+						"insecure":    !trusted,
 					},
 				})
 			}
@@ -237,12 +296,19 @@ func GenerateClientConfigs(cfg *Config, opt ExportOptions) string {
 				pw = l.Passwords[0]
 			}
 			sni := safeSNI(host)
+			trusted := l.TLS != nil && isTrustedCertForHost(l.TLS.Cert, host)
+			insecVal := 1
+			if trusted {
+				insecVal = 0
+			}
 			// 输出直连节点与端口跳跃节点
-			directLink := fmt.Sprintf("hysteria2://%s@%s:%d?sni=%s&insecure=1#mproxy-Hysteria2", pw, host, port, sni)
+			directLink := fmt.Sprintf("hysteria2://%s@%s:%d?sni=%s&insecure=%d#mproxy-Hysteria2", pw, host, port, sni, insecVal)
 			sb.WriteString(fmt.Sprintf("[Hysteria 2 节点 (直连极速抗丢包)]\n%s\n\n", directLink))
+			rawLinks = append(rawLinks, directLink)
 
-			hopLink := fmt.Sprintf("hysteria2://%s@%s:%d?sni=%s&insecure=1&mport=20000-50000#mproxy-Hysteria2-PortHopping", pw, host, port, sni)
+			hopLink := fmt.Sprintf("hysteria2://%s@%s:%d?sni=%s&insecure=%d&mport=20000-50000#mproxy-Hysteria2-PortHopping", pw, host, port, sni, insecVal)
 			sb.WriteString(fmt.Sprintf("[Hysteria 2 端口跳跃节点 (20000-50000)]\n%s\n\n", hopLink))
+			rawLinks = append(rawLinks, hopLink)
 
 			clashProxies = append(clashProxies, map[string]any{
 				"name":             fmt.Sprintf("Hy2-Node-%d", i+1),
@@ -252,7 +318,7 @@ func GenerateClientConfigs(cfg *Config, opt ExportOptions) string {
 				"ports":            "20000-50000",
 				"password":         pw,
 				"sni":              sni,
-				"skip-cert-verify": true,
+				"skip-cert-verify": !trusted,
 			})
 
 			singboxOutbounds = append(singboxOutbounds, map[string]any{
@@ -265,7 +331,7 @@ func GenerateClientConfigs(cfg *Config, opt ExportOptions) string {
 				"tls": map[string]any{
 					"enabled":     true,
 					"server_name": sni,
-					"insecure":    true,
+					"insecure":    !trusted,
 				},
 			})
 
@@ -275,9 +341,14 @@ func GenerateClientConfigs(cfg *Config, opt ExportOptions) string {
 				pw = l.Passwords[0]
 			}
 			sni := safeSNI(host)
-			// 关键修复：注入 allowInsecure=1 确保 Trojan 自签证书秒通
-			link := fmt.Sprintf("trojan://%s@%s:%d?security=tls&sni=%s&allowInsecure=1#mproxy-Trojan", pw, host, port, sni)
+			trusted := l.TLS != nil && isTrustedCertForHost(l.TLS.Cert, host)
+			insecParam := "&allowInsecure=1"
+			if trusted {
+				insecParam = ""
+			}
+			link := fmt.Sprintf("trojan://%s@%s:%d?security=tls&sni=%s%s#mproxy-Trojan", pw, host, port, sni, insecParam)
 			sb.WriteString(fmt.Sprintf("[Trojan 节点]\n%s\n\n", link))
+			rawLinks = append(rawLinks, link)
 
 			clashProxies = append(clashProxies, map[string]any{
 				"name":             fmt.Sprintf("Trojan-Node-%d", i+1),
@@ -287,7 +358,7 @@ func GenerateClientConfigs(cfg *Config, opt ExportOptions) string {
 				"password":         pw,
 				"sni":              sni,
 				"udp":              true,
-				"skip-cert-verify": true,
+				"skip-cert-verify": !trusted,
 			})
 
 			singboxOutbounds = append(singboxOutbounds, map[string]any{
@@ -299,7 +370,7 @@ func GenerateClientConfigs(cfg *Config, opt ExportOptions) string {
 				"tls": map[string]any{
 					"enabled":     true,
 					"server_name": sni,
-					"insecure":    true,
+					"insecure":    !trusted,
 				},
 			})
 
@@ -307,6 +378,7 @@ func GenerateClientConfigs(cfg *Config, opt ExportOptions) string {
 			encoded := base64.StdEncoding.EncodeToString([]byte(fmt.Sprintf("%s:%s", l.Method, l.Password)))
 			link := fmt.Sprintf("ss://%s@%s:%d#mproxy-Shadowsocks", encoded, host, port)
 			sb.WriteString(fmt.Sprintf("[Shadowsocks 节点]\n%s\n\n", link))
+			rawLinks = append(rawLinks, link)
 
 			clashProxies = append(clashProxies, map[string]any{
 				"name":     fmt.Sprintf("SS-Node-%d", i+1),
@@ -327,6 +399,13 @@ func GenerateClientConfigs(cfg *Config, opt ExportOptions) string {
 				"password":    l.Password,
 			})
 		}
+	}
+
+	if len(rawLinks) > 0 {
+		b64Sub := base64.StdEncoding.EncodeToString([]byte(strings.Join(rawLinks, "\n")))
+		sb.WriteString("[v2rayN / Shadowrocket 整包一键导入 Base64 订阅串 (复制下方整行 Ctrl+V 导入全部节点)]\n")
+		sb.WriteString(b64Sub)
+		sb.WriteString("\n\n")
 	}
 
 	sb.WriteString("----------------- [2] Clash.Meta (Mihomo) 配置片段 -----------------\n")

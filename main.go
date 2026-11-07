@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bufio"
 	"context"
 	"crypto/tls"
 	"encoding/json"
@@ -178,7 +177,8 @@ func run(ctx context.Context, cfg *Config) error {
 			upstreamHandler := coreHandler
 			wsCfg := lc.Transport.WS
 			coreHandler = func(ctx context.Context, c net.Conn) {
-				br := bufio.NewReaderSize(c, 8192)
+				br := acquireReader(c)
+				defer releaseReader(br)
 				wsConn, err := UpgradeWebSocket(c, br, wsCfg)
 				if err != nil {
 					guard.Fail(addrOf(c))
@@ -212,6 +212,14 @@ func run(ctx context.Context, cfg *Config) error {
 				GetCertificate: cl.get,
 				MinVersion:     tls.VersionTLS12,
 				NextProtos:     []string{"h2", "http/1.1"},
+				CipherSuites: []uint16{
+					tls.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
+					tls.TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
+					tls.TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256,
+					tls.TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256,
+					tls.TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
+					tls.TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
+				},
 			}
 			inner := coreHandler
 			h = func(ctx context.Context, c net.Conn) {
