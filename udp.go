@@ -175,6 +175,12 @@ func (m *UDPManager) handleResponseLoop(ctx context.Context, sess *UDPSession) {
 	defer func() {
 		sess.cancel()
 		_ = sess.outConn.Close()
+		m.mu.Lock()
+		if cur, ok := m.sessions[sess.clientAddr]; ok && cur == sess {
+			delete(m.sessions, sess.clientAddr)
+			m.activeSess.Add(-1)
+		}
+		m.mu.Unlock()
 	}()
 
 	bp := udpBufPool.Get().(*[]byte)

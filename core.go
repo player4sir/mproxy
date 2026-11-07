@@ -106,14 +106,20 @@ func addrOf(c net.Conn) netip.Addr {
 func (g *Guard) Acquire(ip netip.Addr) bool {
 	g.mu.Lock()
 	now := time.Now()
-	if until, ok := g.trusted[ip]; !ok || now.After(until) {
+	until, isTrusted := g.trusted[ip]
+	isTrusted = isTrusted && now.Before(until)
+	if !isTrusted {
 		if f := g.fails[ip]; f != nil && now.Before(f.until) {
 			g.mu.Unlock()
 			stats.Banned.Add(1)
 			return false
 		}
 	}
-	if g.conns[ip] >= g.lim.MaxConnsPerIP {
+	maxPerIP := g.lim.MaxConnsPerIP
+	if isTrusted && maxPerIP < 2048 {
+		maxPerIP = 2048
+	}
+	if g.conns[ip] >= maxPerIP {
 		g.mu.Unlock()
 		stats.Rejected.Add(1)
 		return false
