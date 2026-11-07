@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"crypto/ecdh"
 	"crypto/x509"
 	"encoding/base64"
@@ -12,11 +13,39 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // ExportOptions 客户端导出选项
 type ExportOptions struct {
-	PublicHost string // 外部可访问的公网 IP 或域名
+	PublicHost string // 外部可访问的公网域名或 IP
+	PublicIP   string // 服务器真实公网 IPv4（供 Hysteria2 等直连协议零 DNS 拨号，消除 Bootstrap DNS 超时与 Fake-IP 劫持）
+}
+
+// resolveDirectHost 获取直连协议（Hysteria2 / Raw TCP / Trojan / SS）的拨号目标地址：
+// 优先使用真实公网 IPv4，而 TLS SNI 仍保留绑定域名，从而跳过客户端本地 UDP 53 Bootstrap DNS 查询并避免其他代理 TUN Fake-IP 劫持。
+func resolveDirectHost(host, explicitIP string) string {
+	if trimmed := strings.TrimSpace(explicitIP); trimmed != "" {
+		if ip := net.ParseIP(trimmed); ip != nil {
+			if ip4 := ip.To4(); ip4 != nil {
+				return ip4.String()
+			}
+			return ip.String()
+		}
+	}
+	if host == "" || host == "YOUR_SERVER_IP" || host == "localhost" || net.ParseIP(host) != nil {
+		return host
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if ips, err := net.DefaultResolver.LookupIP(ctx, "ip4", host); err == nil {
+		for _, ip := range ips {
+			if ip4 := ip.To4(); ip4 != nil && !ip4.IsLoopback() && !ip4.IsUnspecified() {
+				return ip4.String()
+			}
+		}
+	}
+	return host
 }
 
 func safeSNI(host string) string {
@@ -61,6 +90,7 @@ func GenerateClientConfigs(cfg *Config, opt ExportOptions) string {
 	if host == "" {
 		host = "YOUR_SERVER_IP"
 	}
+	directHost := resolveDirectHost(host, opt.PublicIP)
 
 	sb.WriteString("====================================================================\n")
 	sb.WriteString("            mproxy 全平台客户端免配置即连订阅链接\n")
@@ -114,21 +144,21 @@ func GenerateClientConfigs(cfg *Config, opt ExportOptions) string {
 
 				// VLESS + Reality 标准 URI (注入真实合法公钥 pbk，彻底消除 REPLACE_WITH_REALITY_PUBKEY 占位符)
 				link := fmt.Sprintf("vless://%s@%s:%d?encryption=none&security=reality&sni=%s&fp=chrome&pbk=%s&sid=%s&type=tcp#mproxy-VLESS-Reality",
-					uuid, host, port, sni, pubKey, sid)
+					uuid, directHost, port, sni, pubKey, sid)
 				sb.WriteString(fmt.Sprintf("[VLESS Reality 节点 (免域名强抗封锁)]\n%s\n\n", link))
 				rawLinks = append(rawLinks, link)
 
 				// 同时导出标准 VLESS + TLS 节点（全平台 100% 极速通畅，免证书配置）
 				tlsSNI := safeSNI(host)
 				tlsLink := fmt.Sprintf("vless://%s@%s:%d?encryption=none&security=tls&allowInsecure=1&sni=%s&type=tcp#mproxy-VLESS-TLS",
-					uuid, host, port, tlsSNI)
+					uuid, directHost, port, tlsSNI)
 				sb.WriteString(fmt.Sprintf("[VLESS TLS 节点 (全平台秒通)]\n%s\n\n", tlsLink))
 				rawLinks = append(rawLinks, tlsLink)
 
 				clashProxies = append(clashProxies, map[string]any{
 					"name":               fmt.Sprintf("VLESS-Reality-%d", i+1),
 					"type":               "vless",
-					"server":             host,
+					"server":             directHost,
 					"port":               port,
 					"uuid":               uuid,
 					"network":            "tcp",
@@ -145,7 +175,7 @@ func GenerateClientConfigs(cfg *Config, opt ExportOptions) string {
 				singboxOutbounds = append(singboxOutbounds, map[string]any{
 					"type":        "vless",
 					"tag":         fmt.Sprintf("vless-reality-%d", i+1),
-					"server":      host,
+					"server":      directHost,
 					"server_port": port,
 					"uuid":        uuid,
 					"tls": map[string]any{
@@ -251,6 +281,7 @@ func GenerateClientConfigs(cfg *Config, opt ExportOptions) string {
 
 			} else if l.TLS != nil {
 				// VLESS + TLS (443 端口同时支持直连 VLESS-TLS 与 Cloudflare 443 WSS)
+				// 直连 TCP 节点采用真实公网 IPv4 (directHost) + 域名 SNI，跳过客户端 Bootstrap DNS 且不受开启 Cloudflare 橙色云影响
 				sni := safeSNI(host)
 				trusted := isTrustedCertForHost(l.TLS.Cert, host)
 				insecParam := "&allowInsecure=1"
@@ -258,11 +289,11 @@ func GenerateClientConfigs(cfg *Config, opt ExportOptions) string {
 					insecParam = ""
 				}
 				link := fmt.Sprintf("vless://%s@%s:%d?encryption=none&security=tls%s&sni=%s&fp=chrome&type=tcp#mproxy-VLESS-TLS",
-					uuid, host, port, insecParam, sni)
+					uuid, directHost, port, insecParam, sni)
 				sb.WriteString(fmt.Sprintf("[VLESS TLS 节点]\n%s\n\n", link))
 				rawLinks = append(rawLinks, link)
 
-				// 额外输出 443 单端口复用的 VLESS-WSS 节点（可供开启 Cloudflare 小黄云 443 端口直接使用）
+				// 额外输出 443 单端口复用的 VLESS-WSS 节点（保留域名地址，专供开启 Cloudflare 小黄云 443 端口直接使用）
 				wssLink := fmt.Sprintf("vless://%s@%s:%d?encryption=none&security=tls%s&sni=%s&fp=chrome&alpn=http%%2F1.1&type=ws&host=%s&path=%s#mproxy-VLESS-WSS-443",
 					uuid, host, port, insecParam, sni, sni, url.QueryEscape("/vless-ws?ed=2048"))
 				sb.WriteString(fmt.Sprintf("[VLESS WSS 443 节点 (支持开启 Cloudflare 橙色云)]\n%s\n\n", wssLink))
@@ -271,7 +302,7 @@ func GenerateClientConfigs(cfg *Config, opt ExportOptions) string {
 				clashProxies = append(clashProxies, map[string]any{
 					"name":             fmt.Sprintf("VLESS-TLS-%d", i+1),
 					"type":             "vless",
-					"server":           host,
+					"server":           directHost,
 					"port":             port,
 					"uuid":             uuid,
 					"network":          "tcp",
@@ -284,7 +315,7 @@ func GenerateClientConfigs(cfg *Config, opt ExportOptions) string {
 				singboxOutbounds = append(singboxOutbounds, map[string]any{
 					"type":        "vless",
 					"tag":         fmt.Sprintf("vless-tls-%d", i+1),
-					"server":      host,
+					"server":      directHost,
 					"server_port": port,
 					"uuid":        uuid,
 					"tls": map[string]any{
@@ -309,19 +340,20 @@ func GenerateClientConfigs(cfg *Config, opt ExportOptions) string {
 			if trusted {
 				insecVal = 0
 			}
-			// 输出直连节点与端口跳跃节点（显式携带 alpn=h3 确保双内核握手一致）
-			directLink := fmt.Sprintf("hysteria2://%s@%s:%d?sni=%s&alpn=h3&insecure=%d#mproxy-Hysteria2", pw, host, port, sni, insecVal)
+			// Hysteria 2 基于纯 UDP/QUIC 直连，使用真实公网 IPv4 (directHost) 作为拨号地址并保留域名 SNI + 正规证书校验，
+			// 彻底杜绝 sing-box 本地 UDP 53 (如 119.29.29.29) 解析超时导致 -1，以及杜绝其他代理 TUN Fake-IP (198.18.x.x) 劫持！
+			directLink := fmt.Sprintf("hysteria2://%s@%s:%d?sni=%s&alpn=h3&insecure=%d#mproxy-Hysteria2", pw, directHost, port, sni, insecVal)
 			sb.WriteString(fmt.Sprintf("[Hysteria 2 节点 (直连极速抗丢包)]\n%s\n\n", directLink))
 			rawLinks = append(rawLinks, directLink)
 
-			hopLink := fmt.Sprintf("hysteria2://%s@%s:%d?sni=%s&alpn=h3&insecure=%d&mport=20000-50000#mproxy-Hysteria2-PortHopping", pw, host, port, sni, insecVal)
+			hopLink := fmt.Sprintf("hysteria2://%s@%s:%d?sni=%s&alpn=h3&insecure=%d&mport=20000-50000#mproxy-Hysteria2-PortHopping", pw, directHost, port, sni, insecVal)
 			sb.WriteString(fmt.Sprintf("[Hysteria 2 端口跳跃节点 (20000-50000)]\n%s\n\n", hopLink))
 			rawLinks = append(rawLinks, hopLink)
 
 			clashProxies = append(clashProxies, map[string]any{
 				"name":             fmt.Sprintf("Hy2-Node-%d", i+1),
 				"type":             "hysteria2",
-				"server":           host,
+				"server":           directHost,
 				"port":             port,
 				"ports":            "20000-50000",
 				"password":         pw,
@@ -331,12 +363,11 @@ func GenerateClientConfigs(cfg *Config, opt ExportOptions) string {
 			})
 
 			singboxOutbounds = append(singboxOutbounds, map[string]any{
-				"type":         "hysteria2",
-				"tag":          fmt.Sprintf("hy2-node-%d", i+1),
-				"server":       host,
-				"server_port":  port,
-				"hop_interval": "30s",
-				"password":     pw,
+				"type":        "hysteria2",
+				"tag":         fmt.Sprintf("hy2-node-%d", i+1),
+				"server":      directHost,
+				"server_port": port,
+				"password":    pw,
 				"tls": map[string]any{
 					"enabled":     true,
 					"server_name": sni,
@@ -356,14 +387,14 @@ func GenerateClientConfigs(cfg *Config, opt ExportOptions) string {
 			if trusted {
 				insecParam = ""
 			}
-			link := fmt.Sprintf("trojan://%s@%s:%d?security=tls&sni=%s%s#mproxy-Trojan", pw, host, port, sni, insecParam)
+			link := fmt.Sprintf("trojan://%s@%s:%d?security=tls&sni=%s%s#mproxy-Trojan", pw, directHost, port, sni, insecParam)
 			sb.WriteString(fmt.Sprintf("[Trojan 节点]\n%s\n\n", link))
 			rawLinks = append(rawLinks, link)
 
 			clashProxies = append(clashProxies, map[string]any{
 				"name":             fmt.Sprintf("Trojan-Node-%d", i+1),
 				"type":             "trojan",
-				"server":           host,
+				"server":           directHost,
 				"port":             port,
 				"password":         pw,
 				"sni":              sni,
@@ -374,7 +405,7 @@ func GenerateClientConfigs(cfg *Config, opt ExportOptions) string {
 			singboxOutbounds = append(singboxOutbounds, map[string]any{
 				"type":        "trojan",
 				"tag":         fmt.Sprintf("trojan-node-%d", i+1),
-				"server":      host,
+				"server":      directHost,
 				"server_port": port,
 				"password":    pw,
 				"tls": map[string]any{
@@ -386,14 +417,14 @@ func GenerateClientConfigs(cfg *Config, opt ExportOptions) string {
 
 		case "shadowsocks":
 			encoded := base64.StdEncoding.EncodeToString([]byte(fmt.Sprintf("%s:%s", l.Method, l.Password)))
-			link := fmt.Sprintf("ss://%s@%s:%d#mproxy-Shadowsocks", encoded, host, port)
+			link := fmt.Sprintf("ss://%s@%s:%d#mproxy-Shadowsocks", encoded, directHost, port)
 			sb.WriteString(fmt.Sprintf("[Shadowsocks 节点]\n%s\n\n", link))
 			rawLinks = append(rawLinks, link)
 
 			clashProxies = append(clashProxies, map[string]any{
 				"name":     fmt.Sprintf("SS-Node-%d", i+1),
 				"type":     "ss",
-				"server":   host,
+				"server":   directHost,
 				"port":     port,
 				"cipher":   l.Method,
 				"password": l.Password,
@@ -403,7 +434,7 @@ func GenerateClientConfigs(cfg *Config, opt ExportOptions) string {
 			singboxOutbounds = append(singboxOutbounds, map[string]any{
 				"type":        "shadowsocks",
 				"tag":         fmt.Sprintf("ss-node-%d", i+1),
-				"server":      host,
+				"server":      directHost,
 				"server_port": port,
 				"method":      l.Method,
 				"password":    l.Password,

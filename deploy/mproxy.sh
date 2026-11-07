@@ -95,6 +95,7 @@ view_sub() {
         return
     fi
     local host_arg="$1"
+    local srv_ip=$(curl -s4 --max-time 2 ip.sb || curl -s4 --max-time 2 ifconfig.me || echo "")
     if [[ -z "$host_arg" ]]; then
         # 优先读取已绑定的正规证书域名，或从 /etc/mproxy/cert.pem 自动提取非自签域名
         if [[ -f /etc/mproxy/domain ]]; then
@@ -107,10 +108,10 @@ view_sub() {
         fi
     fi
     if [[ -z "$host_arg" ]]; then
-        host_arg=$(curl -s4 --max-time 3 ip.sb || curl -s4 --max-time 3 ifconfig.me || echo "YOUR_SERVER_IP")
+        host_arg="${srv_ip:-YOUR_SERVER_IP}"
     fi
-    echo -e "${CYAN}正在生成节点与订阅配置 (地址: $host_arg)...${PLAIN}\n"
-    "$BIN_CORE" -sub -host "$host_arg" -c "$CONFIG_FILE"
+    echo -e "${CYAN}正在生成节点与订阅配置 (域名/地址: $host_arg, 直连 IPv4: ${srv_ip:-自动解析})...${PLAIN}\n"
+    "$BIN_CORE" -sub -host "$host_arg" -ip "$srv_ip" -c "$CONFIG_FILE"
 }
 
 # 编辑配置文件

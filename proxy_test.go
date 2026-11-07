@@ -917,3 +917,78 @@ func TestGuardAuthSuccessNoSelfBan(t *testing.T) {
 		t.Fatal("unauthenticated attacker IP should be banned after 3 failures")
 	}
 }
+
+func TestSubExportDirectIPWithDomainSNI(t *testing.T) {
+	// 生成模拟权威 CA 签发的正规域名证书（Issuer != Subject 且包含 DNSNames）
+	caPriv, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	caTmpl := &x509.Certificate{
+		SerialNumber:          big.NewInt(1),
+		Subject:               pkix.Name{CommonName: "Fake Root CA"},
+		NotBefore:             time.Now().Add(-time.Hour),
+		NotAfter:              time.Now().Add(time.Hour),
+		KeyUsage:              x509.KeyUsageCertSign,
+		BasicConstraintsValid: true,
+		IsCA:                  true,
+	}
+	leafPriv, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	leafTmpl := &x509.Certificate{
+		SerialNumber: big.NewInt(2),
+		Subject:      pkix.Name{CommonName: "aws.mzstd.xyz"},
+		DNSNames:     []string{"aws.mzstd.xyz"},
+		NotBefore:    time.Now().Add(-time.Hour),
+		NotAfter:     time.Now().Add(time.Hour),
+		KeyUsage:     x509.KeyUsageDigitalSignature,
+	}
+	der, err := x509.CreateCertificate(rand.Reader, leafTmpl, caTmpl, &leafPriv.PublicKey, caPriv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	certPath := filepath.Join(t.TempDir(), "cert.pem")
+	if err := os.WriteFile(certPath, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := &Config{
+		Listeners: []ListenerConfig{
+			{
+				Type:  "vless",
+				Listen: ":443",
+				Users: map[string]string{"default": "f62e9241-9bb8-e7b9-a94f-f3a1c8c89ba6"},
+				TLS:   &TLSConfig{Cert: certPath},
+			},
+			{
+				Type:     "hysteria2",
+				Listen:   ":8443",
+				Password: "hy2-test-password",
+				TLS:      &TLSConfig{Cert: certPath},
+			},
+		},
+	}
+
+	out := GenerateClientConfigs(cfg, ExportOptions{
+		PublicHost: "aws.mzstd.xyz",
+		PublicIP:   "3.138.204.5",
+	})
+
+	// Hysteria2 必须使用真实 IPv4 作为拨号地址以绕过客户端 UDP 53 Bootstrap DNS 超时与 Fake-IP 劫持，同时保留域名 SNI 与正规证书校验 (insecure=0)
+	wantHy2 := "hysteria2://hy2-test-password@3.138.204.5:8443?sni=aws.mzstd.xyz&alpn=h3&insecure=0#mproxy-Hysteria2"
+	if !strings.Contains(out, wantHy2) {
+		t.Fatalf("missing expected zero-DNS hy2 link %q in output:\n%s", wantHy2, out)
+	}
+	wantHy2Hop := "hysteria2://hy2-test-password@3.138.204.5:8443?sni=aws.mzstd.xyz&alpn=h3&insecure=0&mport=20000-50000#mproxy-Hysteria2-PortHopping"
+	if !strings.Contains(out, wantHy2Hop) {
+		t.Fatalf("missing expected zero-DNS hy2 port-hopping link %q in output:\n%s", wantHy2Hop, out)
+	}
+	// WSS 443 节点保留域名地址以支持开启 Cloudflare CDN 橙色云
+	wantWSS := "vless://f62e9241-9bb8-e7b9-a94f-f3a1c8c89ba6@aws.mzstd.xyz:443?"
+	if !strings.Contains(out, wantWSS) {
+		t.Fatalf("WSS CDN link should preserve domain host, got:\n%s", out)
+	}
+}
+

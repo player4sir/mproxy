@@ -23,6 +23,7 @@ func main() {
 	check := flag.Bool("t", false, "test config syntax and exit")
 	sub := flag.Bool("sub", false, "generate client configs (sing-box, Clash.Meta, v2rayN) and exit")
 	host := flag.String("host", "", "public IP or domain name for client configs generation")
+	ip := flag.String("ip", "", "public IPv4 address for direct-connection protocols (Hysteria2/TCP)")
 	keygen := flag.Bool("keygen", false, "generate Reality X25519 keypair and short ID and exit")
 	flag.Parse()
 
@@ -53,7 +54,7 @@ func main() {
 		if pubHost == "" {
 			pubHost = "YOUR_SERVER_IP"
 		}
-		fmt.Print(GenerateClientConfigs(cfg, ExportOptions{PublicHost: pubHost}))
+		fmt.Print(GenerateClientConfigs(cfg, ExportOptions{PublicHost: pubHost, PublicIP: *ip}))
 		return
 	}
 
