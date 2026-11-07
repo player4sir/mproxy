@@ -436,7 +436,7 @@ func parseHy2UDP(msg []byte) (sessID uint32, pktID uint16, fragID, fragCount uin
 
 func encodeHy2UDPFrames(sessID uint32, pktID uint16, addr string, payload []byte, maxSize int) [][]byte {
 	addrBytes := []byte(addr)
-	varintLen := quicvarint.Len(uint64(len(addrBytes)))
+	varintLen := int(quicvarint.Len(uint64(len(addrBytes))))
 	hdrLen := 8 + varintLen + len(addrBytes)
 	maxChunk := maxSize - hdrLen
 	if maxChunk < 128 {
@@ -505,8 +505,8 @@ func (h *hy2Handler) handleDatagrams(ctx context.Context, sess quic.Connection) 
 		for _, f := range frames {
 			if err := sess.SendDatagram(f); err != nil {
 				var tooLarge *quic.DatagramTooLargeError
-				if errors.As(err, &tooLarge) && tooLarge.MaxDatagramPayloadSize > 128 {
-					newMax := int(tooLarge.MaxDatagramPayloadSize) - 8
+				if errors.As(err, &tooLarge) {
+					newMax := 900
 					maxDgramSize.Store(int32(newMax))
 					retryFrames := encodeHy2UDPFrames(sID, uint16(pktSeq.Add(1)), respAddr, respPayload, newMax)
 					for _, rf := range retryFrames {
