@@ -26,7 +26,10 @@ func (h *socks5Handler) handle(ctx context.Context, c net.Conn) {
 
 	// 1. 协商认证方式
 	var hdr [2]byte
-	if _, err := io.ReadFull(c, hdr[:]); err != nil || hdr[0] != 5 {
+	if _, err := io.ReadFull(c, hdr[:]); err != nil {
+		return
+	}
+	if hdr[0] != 5 {
 		h.guard.Fail(ip)
 		return
 	}
@@ -55,9 +58,12 @@ func (h *socks5Handler) handle(ctx context.Context, c net.Conn) {
 	}
 
 	// 2. 执行认证
-	if want == 0x02 && !h.auth(c) {
-		h.guard.Fail(ip)
-		return
+	if want == 0x02 {
+		if !h.auth(c) {
+			h.guard.Fail(ip)
+			return
+		}
+		h.guard.AuthSuccess(ip)
 	}
 
 	// 3. 读取请求头

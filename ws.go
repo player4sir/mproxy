@@ -20,24 +20,32 @@ var (
 	errInvalidWS    = errors.New("invalid websocket upgrade request")
 	errClosedWS     = errors.New("websocket connection closed")
 	errWSFrameLarge = errors.New("websocket frame exceeds max size")
+
+	wsWritePool = sync.Pool{
+		New: func() any {
+			b := make([]byte, 65535+16)
+			return &b
+		},
+	}
 )
 
-// WSConfig WebSocket 传输层配置（专用于 Cloudflare 等 CDN 反向代理中转）
+// WSConfig WebSocket 传输层配置（专用于 Cloudflare 等 CDN 反向代理中转及直连 WSS）
 type WSConfig struct {
-	Path        string            `json:"path"`         // 匹配的 HTTP 路径，例如 "/vless-ws"
-	Host        string            `json:"host"`         // 校验的 Host 头（可选）
-	Headers     map[string]string `json:"headers"`      // 校验的自定义 HTTP 头（可选）
-	MaxFrameLen int               `json:"max_frame_len"`// 最大单帧长度（默认 65535）
+	Path        string            `json:"path"`          // 匹配的 HTTP 路径，例如 "/vless-ws"
+	Host        string            `json:"host"`          // 校验的 Host 头（可选）
+	Headers     map[string]string `json:"headers"`       // 校验的自定义 HTTP 头（可选）
+	MaxFrameLen int               `json:"max_frame_len"` // 最大单帧长度（默认 65535）
 }
 
-// wsConn 将底层 TCP/TLS 流包装为全双工 WebSocket 二进制帧流，实现 net.Conn 接口
+// wsConn 将底层 TCP/TLS 流包装为全双工 WebSocket 二进制帧流，实现完整 net.Conn + closeWriter 接口
 type wsConn struct {
 	net.Conn
-	r          *bufio.Reader
-	remoteAddr net.Addr
-	readLeft   []byte
-	wmu        sync.Mutex
-	maxLen     int
+	r           *bufio.Reader
+	remoteAddr  net.Addr
+	readLeft    []byte
+	wmu         sync.Mutex
+	closedWrite bool
+	maxLen      int
 }
 
 func (c *wsConn) RemoteAddr() net.Addr {
@@ -55,14 +63,11 @@ func (c *wsConn) Read(p []byte) (int, error) {
 	}
 
 	for {
-		// 读取 RFC 6455 帧头（最少 2 字节）
 		var b [2]byte
 		if _, err := io.ReadFull(c.r, b[:]); err != nil {
 			return 0, err
 		}
 
-		fin := (b[0] & 0x80) != 0
-		_ = fin
 		opcode := b[0] & 0x0F
 		masked := (b[1] & 0x80) != 0
 		lenCode := int(b[1] & 0x7F)
@@ -133,68 +138,80 @@ func (c *wsConn) Read(p []byte) (int, error) {
 	}
 }
 
+// Write 将帧头与负载拼合后执行单次底层 Write，减少 50% 系统调用与外层 TLS Record 切片开销
 func (c *wsConn) Write(p []byte) (int, error) {
 	c.wmu.Lock()
 	defer c.wmu.Unlock()
 
 	total := len(p)
+	bp := wsWritePool.Get().(*[]byte)
+	defer wsWritePool.Put(bp)
+	frameBuf := *bp
+
 	for len(p) > 0 {
+		maxChunk := c.maxLen
+		if maxChunk > 65535 {
+			maxChunk = 65535
+		}
 		chunk := p
-		if len(chunk) > c.maxLen {
-			chunk = p[:c.maxLen]
+		if len(chunk) > maxChunk {
+			chunk = p[:maxChunk]
 		}
 		p = p[len(chunk):]
 
-		// 服务端回传 WebSocket 帧默认不掩码 (Unmasked)
-		var hdr [10]byte
-		hdr[0] = 0x82 // FIN + Binary Frame (0x02)
-		var hlen int
-
 		n := len(chunk)
+		var hlen int
+		frameBuf[0] = 0x82 // FIN + Binary Frame (0x02)
 		if n < 126 {
-			hdr[1] = byte(n)
+			frameBuf[1] = byte(n)
 			hlen = 2
-		} else if n <= 65535 {
-			hdr[1] = 126
-			binary.BigEndian.PutUint16(hdr[2:4], uint16(n))
-			hlen = 4
 		} else {
-			hdr[1] = 127
-			binary.BigEndian.PutUint64(hdr[2:10], uint64(n))
-			hlen = 10
+			frameBuf[1] = 126
+			binary.BigEndian.PutUint16(frameBuf[2:4], uint16(n))
+			hlen = 4
 		}
 
-		if _, err := c.Conn.Write(hdr[:hlen]); err != nil {
-			return 0, err
-		}
-		if _, err := c.Conn.Write(chunk); err != nil {
+		copy(frameBuf[hlen:], chunk)
+		if _, err := c.Conn.Write(frameBuf[:hlen+n]); err != nil {
 			return 0, err
 		}
 	}
 	return total, nil
 }
 
-func (c *wsConn) writeControlFrame(opcode byte, data []byte) error {
-	var hdr [2]byte
-	hdr[0] = 0x80 | (opcode & 0x0F)
-	hdr[1] = byte(len(data) & 0x7F)
-	if _, err := c.Conn.Write(hdr[:]); err != nil {
-		return err
+// CloseWrite 发送标准 RFC 6455 Close 帧并半关闭写端，避免客户端报 close 1006 unexpected EOF
+func (c *wsConn) CloseWrite() error {
+	c.wmu.Lock()
+	defer c.wmu.Unlock()
+	if c.closedWrite {
+		return nil
 	}
-	if len(data) > 0 {
-		_, err := c.Conn.Write(data)
-		return err
-	}
+	c.closedWrite = true
+	_ = c.writeControlFrame(0x08, nil)
+	closeWrite(c.Conn)
 	return nil
 }
 
-// UpgradeWebSocket 完成 HTTP Upgrade 握手，提取真实客户端 IP，并返回包装后的 net.Conn
+func (c *wsConn) writeControlFrame(opcode byte, data []byte) error {
+	var frame [130]byte
+	frame[0] = 0x80 | (opcode & 0x0F)
+	frame[1] = byte(len(data) & 0x7F)
+	n := copy(frame[2:], data)
+	_, err := c.Conn.Write(frame[:2+n])
+	return err
+}
+
+// UpgradeWebSocket 读取 HTTP 请求并执行 WebSocket 协议升级
 func UpgradeWebSocket(raw net.Conn, br *bufio.Reader, cfg *WSConfig) (net.Conn, error) {
 	req, err := http.ReadRequest(br)
 	if err != nil {
 		return nil, fmt.Errorf("read upgrade request: %w", err)
 	}
+	return UpgradeWebSocketWithRequest(raw, br, req, cfg)
+}
 
+// UpgradeWebSocketWithRequest 复用已解析的 *http.Request 完成握手及 ?ed=2048 0-RTT 首包提取
+func UpgradeWebSocketWithRequest(raw net.Conn, br *bufio.Reader, req *http.Request, cfg *WSConfig) (net.Conn, error) {
 	// 1. 路径校验
 	if cfg != nil && cfg.Path != "" {
 		reqPath := req.URL.Path
@@ -227,7 +244,7 @@ func UpgradeWebSocket(raw net.Conn, br *bufio.Reader, cfg *WSConfig) (net.Conn, 
 	}
 
 	// 2. 协议头升级校验
-	if !strings.EqualFold(req.Header.Get("Upgrade"), "websocket") {
+	if !containsFold(req.Header.Get("Upgrade"), "websocket") {
 		_, _ = raw.Write([]byte("HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"))
 		return nil, errInvalidWS
 	}
@@ -244,7 +261,7 @@ func UpgradeWebSocket(raw net.Conn, br *bufio.Reader, cfg *WSConfig) (net.Conn, 
 	h.Write(wsGUID)
 	accept := base64.StdEncoding.EncodeToString(h.Sum(nil))
 
-	// 4. 解析真实客户端 IP（关键：支持 Cloudflare CF-Connecting-IP 与 X-Forwarded-For）
+	// 4. 解析真实客户端 IP（支持 Cloudflare CF-Connecting-IP 与 X-Forwarded-For）
 	realIP := extractRealClientIP(req)
 	var resolvedRemote net.Addr = raw.RemoteAddr()
 	if realIP != nil {
@@ -254,17 +271,14 @@ func UpgradeWebSocket(raw net.Conn, br *bufio.Reader, cfg *WSConfig) (net.Conn, 
 	}
 
 	// 4.5 支持 Xray / v2rayN / sing-box 的 WebSocket 0-RTT Early Data (?ed=2048)
-	// 客户端通过 Sec-WebSocket-Protocol 标头携带 Base64 编码的首包数据，省去 1 个跨洋握手 RTT
 	var earlyData []byte
 	var echoProtocol string
 	if protoHdr := req.Header.Get("Sec-WebSocket-Protocol"); protoHdr != "" {
-		// 处理可能包含逗号分隔的多个子协议或直接的 Base64 载荷
 		for _, part := range strings.Split(protoHdr, ",") {
 			token := strings.TrimSpace(part)
 			if token == "" {
 				continue
 			}
-			// 依次尝试 RawURLEncoding, URLEncoding, StdEncoding, RawStdEncoding
 			if decoded, err := base64.RawURLEncoding.DecodeString(token); err == nil && len(decoded) > 0 {
 				earlyData = decoded
 				echoProtocol = token
@@ -320,19 +334,16 @@ func UpgradeWebSocket(raw net.Conn, br *bufio.Reader, cfg *WSConfig) (net.Conn, 
 
 // extractRealClientIP 提取 CDN 回源头中的真实访客 IP，杜绝 Cloudflare CDN 节点 IP 触发误封
 func extractRealClientIP(req *http.Request) net.IP {
-	// 优先读取 Cloudflare 特有标头
 	if cfIP := req.Header.Get("CF-Connecting-IP"); cfIP != "" {
 		if ip := net.ParseIP(strings.TrimSpace(cfIP)); ip != nil {
 			return ip
 		}
 	}
-	// 备选读取 X-Real-IP
 	if xri := req.Header.Get("X-Real-IP"); xri != "" {
 		if ip := net.ParseIP(strings.TrimSpace(xri)); ip != nil {
 			return ip
 		}
 	}
-	// 备选读取 X-Forwarded-For（取首个非内网 IP）
 	if xff := req.Header.Get("X-Forwarded-For"); xff != "" {
 		parts := strings.Split(xff, ",")
 		for _, part := range parts {

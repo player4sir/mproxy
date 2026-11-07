@@ -16,7 +16,7 @@ import (
 	"time"
 )
 
-// certLoader 支持证书热更新（例如 certbot 自动续期后无需重启服务）
+// certLoader 支持证书热更新（例如 acme.sh 自动续期后无需重启服务）
 type certLoader struct {
 	cert, key string
 	mu        sync.Mutex
@@ -79,11 +79,10 @@ func newTrojanHandler(lc ListenerConfig, out *Outbound, g *Guard, lim Limits, ud
 		if err != nil {
 			return nil, err
 		}
-		// 支持 h2 与 http/1.1 双 ALPN，开启 TLS Session Resumption 与硬件加速密码套件
 		tlsCfg = &tls.Config{
 			GetCertificate: cl.get,
 			MinVersion:     tls.VersionTLS12,
-			NextProtos:     []string{"h2", "http/1.1"},
+			NextProtos:     []string{"http/1.1"},
 			CipherSuites: []uint16{
 				tls.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
 				tls.TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
@@ -120,7 +119,6 @@ func (h *trojanHandler) handle(ctx context.Context, raw net.Conn) {
 	if h.tlsCfg != nil {
 		tc := tls.Server(raw, h.tlsCfg)
 		if err := tc.Handshake(); err != nil {
-			h.guard.Fail(ip) // 非 TLS 扫描器探测
 			return
 		}
 		conn = tc
@@ -128,13 +126,17 @@ func (h *trojanHandler) handle(ctx context.Context, raw net.Conn) {
 	br := acquireReader(conn)
 	defer releaseReader(br)
 
-	// Trojan 头部校验：56 字节 SHA-224 十六进制字符串 + CRLF
-	head, _ := br.Peek(56)
-	if len(head) < 56 {
-		head, _ = br.Peek(br.Buffered())
+	if _, err := br.Peek(1); err != nil {
+		return
 	}
-	if len(head) != 56 {
-		h.guard.Fail(ip)
+	if peek4, err := br.Peek(4); err == nil && isHTTPMethodPrefix(peek4) {
+		h.doFallback(ctx, raw, conn, br)
+		return
+	}
+
+	// Trojan 头部校验：56 字节 SHA-224 十六进制字符串 + CRLF
+	head, err := br.Peek(56)
+	if err != nil {
 		h.doFallback(ctx, raw, conn, br)
 		return
 	}
@@ -143,11 +145,11 @@ func (h *trojanHandler) handle(ctx context.Context, raw net.Conn) {
 		h.doFallback(ctx, raw, conn, br)
 		return
 	}
+	h.guard.AuthSuccess(ip)
 	_, _ = br.Discard(56)
 
 	var crlf [2]byte
 	if _, err := io.ReadFull(br, crlf[:]); err != nil || crlf != [2]byte{'\r', '\n'} {
-		h.guard.Fail(ip)
 		return
 	}
 
@@ -157,11 +159,9 @@ func (h *trojanHandler) handle(ctx context.Context, raw net.Conn) {
 	}
 	host, port, err := readAddr(br)
 	if err != nil {
-		h.guard.Fail(ip)
 		return
 	}
 	if _, err := io.ReadFull(br, crlf[:]); err != nil || crlf != [2]byte{'\r', '\n'} {
-		h.guard.Fail(ip)
 		return
 	}
 
@@ -177,20 +177,17 @@ func (h *trojanHandler) handle(ctx context.Context, raw net.Conn) {
 		_ = conn.SetDeadline(time.Time{})
 		relay(&bufConn{Conn: conn, r: br}, up, h.lim.IdleTimeout.Duration)
 
-	case 0x03: // UDP ASSOCIATE (通过 TLS 流多路复用传输 Trojan UDP 帧)
+	case 0x03: // UDP ASSOCIATE
 		_ = conn.SetDeadline(time.Time{})
-		h.handleTrojanUDP(ctx, conn, br)
-
-	default:
-		h.guard.Fail(ip)
+		if h.udpMgr != nil {
+			h.handleTrojanUDP(ctx, conn, br)
+		}
 	}
 }
 
-// handleTrojanUDP 处理 Trojan 原生 UDP 帧：
-// 客户端帧格式: [ATYP + ADDR + PORT] [Length 2B] [\r\n] [Payload]
-// 服务端回传帧格式: [ATYP + ADDR + PORT] [Length 2B] [\r\n] [Payload]
+// handleTrojanUDP 处理 Trojan 原生 UDP 帧（合并单次 Write 消除多余 TLS Record 开销）
 func (h *trojanHandler) handleTrojanUDP(ctx context.Context, tc net.Conn, br *bufio.Reader) {
-	clientKey := fmt.Sprintf("trojan:%s", tc.RemoteAddr().String())
+	clientKey := fmt.Sprintf("trojan:%d", udpSeq.Add(1))
 	defer h.udpMgr.RemoveSession(clientKey)
 	var writeMu sync.Mutex
 
@@ -216,28 +213,24 @@ func (h *trojanHandler) handleTrojanUDP(ctx context.Context, tc net.Conn, br *bu
 		}
 
 		_ = h.udpMgr.SendPacket(clientKey, tHost, tPort, payload, func(respHost string, respPort int, respPayload []byte) error {
-			writeMu.Lock()
-			defer writeMu.Unlock()
-
-			// 组装 Trojan UDP 响应帧
-			addrHeader, err := writeAddr(nil, respHost, respPort)
+			if len(respPayload) > 65535 {
+				return nil
+			}
+			pkt := make([]byte, 0, 24+len(respPayload))
+			var err error
+			pkt, err = writeAddr(pkt, respHost, respPort)
 			if err != nil {
 				return err
 			}
 			var lBytes [2]byte
 			binary.BigEndian.PutUint16(lBytes[:], uint16(len(respPayload)))
+			pkt = append(pkt, lBytes[0], lBytes[1], '\r', '\n')
+			pkt = append(pkt, respPayload...)
 
+			writeMu.Lock()
+			defer writeMu.Unlock()
 			_ = tc.SetWriteDeadline(time.Now().Add(h.lim.IdleTimeout.Duration))
-			if _, err := tc.Write(addrHeader); err != nil {
-				return err
-			}
-			if _, err := tc.Write(lBytes[:]); err != nil {
-				return err
-			}
-			if _, err := tc.Write([]byte{'\r', '\n'}); err != nil {
-				return err
-			}
-			_, err = tc.Write(respPayload)
+			_, err = tc.Write(pkt)
 			return err
 		})
 	}
@@ -253,7 +246,6 @@ func (h *trojanHandler) doFallback(ctx context.Context, raw net.Conn, tc net.Con
 	if err != nil {
 		return
 	}
-	// 如果配置了 PROXY 协议，先向后端发送真实的客户端源地址
 	if h.proxyProtocol {
 		hdr := buildProxyProtocolV1Header(raw.RemoteAddr(), raw.LocalAddr())
 		_, _ = fb.Write(hdr)

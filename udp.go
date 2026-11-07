@@ -7,6 +7,7 @@ import (
 	"io"
 	"log/slog"
 	"net"
+	"net/netip"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -14,12 +15,15 @@ import (
 
 // ---------- UDP 缓冲池与会话管理 ----------
 
-var udpBufPool = sync.Pool{
-	New: func() any {
-		b := make([]byte, 65535)
-		return &b
-	},
-}
+var (
+	udpSeq     atomic.Uint64
+	udpBufPool = sync.Pool{
+		New: func() any {
+			b := make([]byte, 65535)
+			return &b
+		},
+	}
+)
 
 type UDPSession struct {
 	clientAddr string
@@ -30,7 +34,7 @@ type UDPSession struct {
 	handler    UDPResponseHandler
 }
 
-// UDPResponseHandler 将出站目标回包重新组装为特定协议格式（如 SOCKS5 / Trojan / Shadowsocks）并送回客户端
+// UDPResponseHandler 将出站目标回包重新组装为特定协议格式并送回客户端
 type UDPResponseHandler func(targetHost string, targetPort int, payload []byte) error
 
 type UDPManager struct {
@@ -96,18 +100,27 @@ func (m *UDPManager) RemoveSession(clientKey string) {
 
 // SendPacket 转发客户端的一个 UDP 数据包到目标地址
 func (m *UDPManager) SendPacket(clientKey string, targetHost string, targetPort int, payload []byte, respHandler UDPResponseHandler) error {
-	ips, err := m.outbound.ResolveTarget(context.Background(), targetHost)
+	rctx, rcancel := context.WithTimeout(context.Background(), 3*time.Second)
+	ips, err := m.outbound.ResolveTarget(rctx, targetHost)
+	rcancel()
 	if err != nil {
 		return fmt.Errorf("resolve udp dst %s: %w", targetHost, err)
 	}
-	dstAddr := &net.UDPAddr{IP: ips[0], Port: targetPort}
+
+	dstIP := ips[0]
+	for _, candidate := range ips {
+		if ip4 := candidate.To4(); ip4 != nil {
+			dstIP = ip4
+			break
+		}
+	}
+	dstAddr := &net.UDPAddr{IP: dstIP, Port: targetPort}
 
 	m.mu.RLock()
 	sess, ok := m.sessions[clientKey]
 	m.mu.RUnlock()
 
 	if !ok {
-		// 创建新会话
 		m.mu.Lock()
 		sess, ok = m.sessions[clientKey]
 		if !ok {
@@ -117,11 +130,18 @@ func (m *UDPManager) SendPacket(clientKey string, targetHost string, targetPort 
 					laddr = &net.UDPAddr{IP: ip}
 				}
 			}
-			outConn, err := net.ListenUDP("udp", laddr)
+			udpNet := "udp4"
+			if dstIP.To4() == nil || m.outbound.hasIPv6 {
+				udpNet = "udp"
+			}
+			outConn, err := net.ListenUDP(udpNet, laddr)
 			if err != nil {
 				m.mu.Unlock()
 				return fmt.Errorf("listen outbound udp: %w", err)
 			}
+			_ = outConn.SetReadBuffer(2 * 1024 * 1024)
+			_ = outConn.SetWriteBuffer(2 * 1024 * 1024)
+
 			ctx, cancel := context.WithCancel(context.Background())
 			sess = &UDPSession{
 				clientAddr: clientKey,
@@ -133,7 +153,6 @@ func (m *UDPManager) SendPacket(clientKey string, targetHost string, targetPort 
 			m.sessions[clientKey] = sess
 			m.activeSess.Add(1)
 
-			// 启动该会话的回包监听 goroutine
 			go m.handleResponseLoop(ctx, sess)
 		}
 		m.mu.Unlock()
@@ -177,7 +196,6 @@ func (m *UDPManager) handleResponseLoop(ctx context.Context, sess *UDPSession) {
 			}
 			var ne net.Error
 			if errors.As(err, &ne) && ne.Timeout() {
-				// 超时由 reaper 集中清理
 				continue
 			}
 			return
@@ -187,6 +205,9 @@ func (m *UDPManager) handleResponseLoop(ctx context.Context, sess *UDPSession) {
 			sess.lastActive.Store(time.Now().Unix())
 			stats.BytesDown.Add(int64(n))
 			rHost := remoteAddr.IP.String()
+			if nip, ok := netip.AddrFromSlice(remoteAddr.IP); ok {
+				rHost = nip.Unmap().String()
+			}
 			rPort := remoteAddr.Port
 
 			sess.handlerMu.RLock()

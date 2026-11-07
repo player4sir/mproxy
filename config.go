@@ -81,6 +81,19 @@ func (l *ListenerConfig) IsUDP() bool {
 	return *l.UDP
 }
 
+// findGlobalTLS 查找配置中首个有效的 TLS 证书配置，供未显式配置证书的 WS 监听器双栈复用
+func findGlobalTLS(cfg *Config) *TLSConfig {
+	if cfg == nil {
+		return nil
+	}
+	for _, l := range cfg.Listeners {
+		if l.TLS != nil && l.TLS.Cert != "" && l.TLS.Key != "" {
+			return l.TLS
+		}
+	}
+	return nil
+}
+
 func loadConfig(path string) (*Config, error) {
 	b, err := os.ReadFile(path)
 	if err != nil {

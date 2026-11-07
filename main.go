@@ -116,6 +116,26 @@ func run(ctx context.Context, cfg *Config) error {
 	var udpListeners []*net.UDPConn
 	var quicListeners []*quic.Listener
 
+	// 全局证书探测：供未显式配置 TLS 的 WebSocket 监听器（如 8080 端口）自动提供 TLS(WSS) + 明文(WS) 双栈兼容
+	var globalWSTLSCfg *tls.Config
+	if gTLS := findGlobalTLS(cfg); gTLS != nil {
+		if cl, err := newCertLoader(gTLS.Cert, gTLS.Key); err == nil {
+			globalWSTLSCfg = &tls.Config{
+				GetCertificate: cl.get,
+				MinVersion:     tls.VersionTLS12,
+				NextProtos:     []string{"http/1.1"},
+				CipherSuites: []uint16{
+					tls.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
+					tls.TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
+					tls.TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256,
+					tls.TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256,
+					tls.TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
+					tls.TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
+				},
+			}
+		}
+	}
+
 	for _, lc := range cfg.Listeners {
 		// Hysteria 2 基于 QUIC/UDP，独立处理监听器初始化
 		if lc.Type == "hysteria2" || lc.Type == "hy2" {
@@ -172,30 +192,31 @@ func run(ctx context.Context, cfg *Config) error {
 			coreHandler = vh.handle
 		}
 
-		// 传输层中介包装：如果配置了 WebSocket（例如 Cloudflare CDN 代理中转）
+		// 传输层中介包装：如果配置了 WebSocket（例如 Cloudflare CDN 代理中转或直连 WSS）
 		if lc.Transport != nil && lc.Transport.Type == "ws" {
 			upstreamHandler := coreHandler
 			wsCfg := lc.Transport.WS
 			coreHandler = func(ctx context.Context, c net.Conn) {
+				_ = c.SetReadDeadline(time.Now().Add(cfg.Limits.HandshakeTimeout.Duration))
 				br := acquireReader(c)
 				defer releaseReader(br)
 				wsConn, err := UpgradeWebSocket(c, br, wsCfg)
 				if err != nil {
-					guard.Fail(addrOf(c))
 					return
 				}
+				_ = c.SetReadDeadline(time.Time{})
 				upstreamHandler(ctx, wsConn)
 			}
 		}
 
-		// 传输层外层包装：Reality 或标准 TLS (WSS / VLESS TLS)
+		// 传输层外层包装：Reality、标准 TLS 或 WebSocket 双栈自适应 (WSS + WS)
 		var h Handler
 		if lc.Reality != nil {
 			var tlsCfg *tls.Config
 			if lc.TLS != nil {
 				cl, err := newCertLoader(lc.TLS.Cert, lc.TLS.Key)
 				if err == nil {
-					tlsCfg = &tls.Config{GetCertificate: cl.get, MinVersion: tls.VersionTLS12, NextProtos: []string{"h2", "http/1.1"}}
+					tlsCfg = &tls.Config{GetCertificate: cl.get, MinVersion: tls.VersionTLS12, NextProtos: []string{"http/1.1"}}
 				}
 			}
 			rh, err := newRealityHandler(lc.Reality, coreHandler, guard, cfg.Limits, tlsCfg)
@@ -211,7 +232,7 @@ func run(ctx context.Context, cfg *Config) error {
 			tlsCfg := &tls.Config{
 				GetCertificate: cl.get,
 				MinVersion:     tls.VersionTLS12,
-				NextProtos:     []string{"h2", "http/1.1"},
+				NextProtos:     []string{"http/1.1"},
 				CipherSuites: []uint16{
 					tls.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
 					tls.TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
@@ -223,12 +244,39 @@ func run(ctx context.Context, cfg *Config) error {
 			}
 			inner := coreHandler
 			h = func(ctx context.Context, c net.Conn) {
+				_ = c.SetDeadline(time.Now().Add(cfg.Limits.HandshakeTimeout.Duration))
 				tc := tls.Server(c, tlsCfg)
 				if err := tc.Handshake(); err != nil {
-					guard.Fail(addrOf(c))
 					return
 				}
+				_ = tc.SetDeadline(time.Time{})
 				inner(ctx, tc)
+			}
+		} else if lc.Transport != nil && lc.Transport.Type == "ws" && globalWSTLSCfg != nil {
+			// 智能双栈嗅探：首字节 0x16 自动执行 TLS (WSS，满足 Xray 26.10.31 强制加密及 Cloudflare Full)，明文 HTTP 直接走 WS (兼容 Cloudflare Flexible)
+			inner := coreHandler
+			wsTLS := globalWSTLSCfg
+			h = func(ctx context.Context, c net.Conn) {
+				_ = c.SetReadDeadline(time.Now().Add(cfg.Limits.HandshakeTimeout.Duration))
+				br := acquireReader(c)
+				defer releaseReader(br)
+				b, err := br.Peek(1)
+				if err != nil {
+					return
+				}
+				_ = c.SetReadDeadline(time.Time{})
+				wrapped := &bufConn{Conn: c, r: br}
+				if b[0] == 0x16 {
+					tc := tls.Server(wrapped, wsTLS)
+					_ = tc.SetDeadline(time.Now().Add(cfg.Limits.HandshakeTimeout.Duration))
+					if err := tc.Handshake(); err != nil {
+						return
+					}
+					_ = tc.SetDeadline(time.Time{})
+					inner(ctx, tc)
+					return
+				}
+				inner(ctx, wrapped)
 			}
 		} else {
 			h = coreHandler

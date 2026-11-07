@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"context"
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"io"
@@ -25,7 +26,7 @@ type Stats struct {
 
 var stats Stats
 
-// ---------- 连接守卫：并发控制、限流与防主动探测封禁 ----------
+// ---------- 连接守卫：并发控制、限流与防主动探测封禁（含已认证白名单保护） ----------
 
 type failRec struct {
 	count int
@@ -34,23 +35,25 @@ type failRec struct {
 }
 
 type Guard struct {
-	lim   Limits
-	sem   chan struct{}
-	mu    sync.Mutex
-	conns map[netip.Addr]int
-	fails map[netip.Addr]*failRec
-	stop  chan struct{}
+	lim     Limits
+	sem     chan struct{}
+	mu      sync.Mutex
+	conns   map[netip.Addr]int
+	fails   map[netip.Addr]*failRec
+	trusted map[netip.Addr]time.Time
+	stop    chan struct{}
 }
 
 func NewGuard(l Limits) *Guard {
 	g := &Guard{
-		lim:   l,
-		sem:   make(chan struct{}, l.MaxConns),
-		conns: make(map[netip.Addr]int),
-		fails: make(map[netip.Addr]*failRec),
-		stop:  make(chan struct{}),
+		lim:     l,
+		sem:     make(chan struct{}, l.MaxConns),
+		conns:   make(map[netip.Addr]int),
+		fails:   make(map[netip.Addr]*failRec),
+		trusted: make(map[netip.Addr]time.Time),
+		stop:    make(chan struct{}),
 	}
-	// 定期清理过期封禁记录
+	// 定期清理过期封禁记录与信任白名单
 	go func() {
 		ticker := time.NewTicker(time.Minute)
 		defer ticker.Stop()
@@ -64,6 +67,11 @@ func NewGuard(l Limits) *Guard {
 				for ip, f := range g.fails {
 					if now.After(f.until) && now.Sub(f.last) > 15*time.Minute {
 						delete(g.fails, ip)
+					}
+				}
+				for ip, until := range g.trusted {
+					if now.After(until) {
+						delete(g.trusted, ip)
 					}
 				}
 				g.mu.Unlock()
@@ -82,8 +90,14 @@ func (g *Guard) Close() {
 }
 
 func addrOf(c net.Conn) netip.Addr {
+	if c == nil || c.RemoteAddr() == nil {
+		return netip.Addr{}
+	}
 	if ta, ok := c.RemoteAddr().(*net.TCPAddr); ok {
 		return ta.AddrPort().Addr().Unmap()
+	}
+	if ua, ok := c.RemoteAddr().(*net.UDPAddr); ok {
+		return netIPToAddr(ua.IP)
 	}
 	return netip.Addr{}
 }
@@ -91,10 +105,13 @@ func addrOf(c net.Conn) netip.Addr {
 // Acquire 检查全局并发上限、单 IP 限制及黑名单状态
 func (g *Guard) Acquire(ip netip.Addr) bool {
 	g.mu.Lock()
-	if f := g.fails[ip]; f != nil && time.Now().Before(f.until) {
-		g.mu.Unlock()
-		stats.Banned.Add(1)
-		return false
+	now := time.Now()
+	if until, ok := g.trusted[ip]; !ok || now.After(until) {
+		if f := g.fails[ip]; f != nil && now.Before(f.until) {
+			g.mu.Unlock()
+			stats.Banned.Add(1)
+			return false
+		}
 	}
 	if g.conns[ip] >= g.lim.MaxConnsPerIP {
 		g.mu.Unlock()
@@ -122,7 +139,18 @@ func (g *Guard) Release(ip netip.Addr) {
 	<-g.sem
 }
 
-// Fail 记录一次认证失败或异常嗅探探针，达到阈值后自动拉黑
+// AuthSuccess 标记某客户端 IP 已成功通过代理认证，2 小时内免于误封并清除历史失败记录
+func (g *Guard) AuthSuccess(ip netip.Addr) {
+	if !ip.IsValid() || ip.IsLoopback() {
+		return
+	}
+	g.mu.Lock()
+	g.trusted[ip] = time.Now().Add(2 * time.Hour)
+	delete(g.fails, ip)
+	g.mu.Unlock()
+}
+
+// Fail 记录一次明确的认证口令错误，达到阈值后自动拉黑（已认证用户 IP 免疫误封）
 func (g *Guard) Fail(ip netip.Addr) {
 	stats.AuthFail.Add(1)
 	if !ip.IsValid() || ip.IsLoopback() {
@@ -130,15 +158,18 @@ func (g *Guard) Fail(ip netip.Addr) {
 	}
 	g.mu.Lock()
 	defer g.mu.Unlock()
+	now := time.Now()
+	if until, ok := g.trusted[ip]; ok && now.Before(until) {
+		return
+	}
 	f := g.fails[ip]
 	if f == nil {
 		f = &failRec{}
 		g.fails[ip] = f
 	}
-	f.last = time.Now()
+	f.last = now
 	f.count++
 	if f.count >= g.lim.BanAfterFailures {
-		// 指数退避：每次封禁时间递增，严防长时间低频探测
 		banDur := g.lim.BanDuration.Duration
 		if f.count > g.lim.BanAfterFailures {
 			mult := f.count - g.lim.BanAfterFailures + 1
@@ -147,22 +178,24 @@ func (g *Guard) Fail(ip netip.Addr) {
 			}
 			banDur = banDur * time.Duration(mult)
 		}
-		f.until = time.Now().Add(banDur)
+		f.until = now.Add(banDur)
 		slog.Warn("probing/auth ban applied", "ip", ip, "duration", banDur)
 	}
 }
 
-// ---------- 智能出站拨号（带 DNS 缓存与 SSRF 防护） ----------
+// ---------- 智能出站拨号（IPv6 路由自检 + Stale-While-Revalidate DNS 缓存 + SSRF 防护） ----------
 
 type dnsEntry struct {
-	ips       []net.IP
-	expiresAt time.Time
+	ips        []net.IP
+	expiresAt  time.Time
+	refreshing bool
 }
 
 type Outbound struct {
 	d            net.Dialer
 	blockPrivate bool
 	bind         string
+	hasIPv6      bool
 	dnsMu        sync.RWMutex
 	dnsCache     map[string]dnsEntry
 }
@@ -184,6 +217,14 @@ func NewOutbound(c OutboundConfig) (*Outbound, error) {
 			return nil, fmt.Errorf("outbound.bind: %w", err)
 		}
 		o.d.LocalAddr = &net.TCPAddr{IP: ip.AsSlice()}
+		o.hasIPv6 = ip.Is6()
+	} else if probe6, err := net.DialUDP("udp6", nil, &net.UDPAddr{IP: net.ParseIP("2001:4860:4860::8888"), Port: 53}); err == nil {
+		// 零流量内核路由表探测：仅当本机真正具备公网全局 IPv6 路由时才启用 AAAA 解析，彻底消灭 AWS EC2 单栈主机 7s IPv6 黑洞卡顿
+		localIP := probe6.LocalAddr().(*net.UDPAddr).IP
+		_ = probe6.Close()
+		if localIP != nil && !localIP.IsLoopback() && !localIP.IsLinkLocalUnicast() && !localIP.IsUnspecified() {
+			o.hasIPv6 = true
+		}
 	}
 
 	if c.BlockPrivate {
@@ -218,59 +259,133 @@ func isBlockedIP(ip net.IP) bool {
 	return true
 }
 
-func (o *Outbound) ResolveTarget(ctx context.Context, host string) ([]net.IP, error) {
-	if ip := net.ParseIP(host); ip != nil {
-		if o.blockPrivate && isBlockedIP(ip) {
-			return nil, errors.New("destination blocked by ssrf policy")
-		}
-		return []net.IP{ip}, nil
+func (o *Outbound) lookupAndCache(ctx context.Context, host string) ([]net.IP, error) {
+	netProto := "ip4"
+	if o.hasIPv6 {
+		netProto = "ip"
 	}
-
-	o.dnsMu.RLock()
-	e, ok := o.dnsCache[host]
-	o.dnsMu.RUnlock()
-	if ok && time.Now().Before(e.expiresAt) {
-		return e.ips, nil
-	}
-
-	ips, err := net.DefaultResolver.LookupIP(ctx, "ip", host)
+	ips, err := net.DefaultResolver.LookupIP(ctx, netProto, host)
 	if err != nil {
+		o.dnsMu.Lock()
+		if cur, exists := o.dnsCache[host]; exists {
+			cur.refreshing = false
+			o.dnsCache[host] = cur
+		}
+		o.dnsMu.Unlock()
 		return nil, err
 	}
 
-	var valid []net.IP
+	var v4, v6 []net.IP
 	for _, ip := range ips {
 		if o.blockPrivate && isBlockedIP(ip) {
 			continue
 		}
-		valid = append(valid, ip)
+		if ip4 := ip.To4(); ip4 != nil {
+			v4 = append(v4, ip4)
+		} else if o.hasIPv6 {
+			v6 = append(v6, ip)
+		}
 	}
+	valid := append(v4, v6...)
 	if len(valid) == 0 {
-		return nil, errors.New("destination blocked by ssrf policy")
+		o.dnsMu.Lock()
+		if cur, exists := o.dnsCache[host]; exists {
+			cur.refreshing = false
+			o.dnsCache[host] = cur
+		}
+		o.dnsMu.Unlock()
+		return nil, errors.New("no routable destination ip available")
 	}
 
 	o.dnsMu.Lock()
 	o.dnsCache[host] = dnsEntry{
-		ips:       valid,
-		expiresAt: time.Now().Add(2 * time.Minute),
+		ips:        valid,
+		expiresAt:  time.Now().Add(5 * time.Minute),
+		refreshing: false,
 	}
 	o.dnsMu.Unlock()
 	return valid, nil
 }
 
-func (o *Outbound) Dial(ctx context.Context, host string, port int) (net.Conn, error) {
-	// 优先使用带 2 分钟 TTL 的内存 DNS 缓存解析目标 IP，消除每次 TCP 连接重复 DNS 查询 (省去 15~60ms)
-	ips, err := o.ResolveTarget(ctx, host)
-	if err != nil {
-		return o.d.DialContext(ctx, "tcp", hostPort(host, port))
+func (o *Outbound) ResolveTarget(ctx context.Context, host string) ([]net.IP, error) {
+	if ip := net.ParseIP(host); ip != nil {
+		if o.blockPrivate && isBlockedIP(ip) {
+			return nil, errors.New("destination blocked by ssrf policy")
+		}
+		if ip4 := ip.To4(); ip4 != nil {
+			return []net.IP{ip4}, nil
+		}
+		return []net.IP{ip}, nil
 	}
+
+	now := time.Now()
+	o.dnsMu.RLock()
+	e, ok := o.dnsCache[host]
+	o.dnsMu.RUnlock()
+	if ok {
+		if now.Before(e.expiresAt) {
+			return e.ips, nil
+		}
+		// Stale-While-Revalidate: 过期 30 分钟内零等待返回缓存 IP，后台异步刷新
+		if now.Sub(e.expiresAt) < 30*time.Minute {
+			o.dnsMu.Lock()
+			cur, stillOK := o.dnsCache[host]
+			needRefresh := stillOK && !cur.refreshing && now.After(cur.expiresAt)
+			if needRefresh {
+				cur.refreshing = true
+				o.dnsCache[host] = cur
+			}
+			o.dnsMu.Unlock()
+			if needRefresh {
+				go func(h string) {
+					rctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
+					defer cancel()
+					_, _ = o.lookupAndCache(rctx, h)
+				}(host)
+			}
+			return e.ips, nil
+		}
+	}
+
+	return o.lookupAndCache(ctx, host)
+}
+
+func (o *Outbound) Dial(ctx context.Context, host string, port int) (net.Conn, error) {
+	rctx, rcancel := context.WithTimeout(ctx, 3*time.Second)
+	ips, err := o.ResolveTarget(rctx, host)
+	rcancel()
+	if err != nil {
+		network := "tcp4"
+		if o.hasIPv6 {
+			network = "tcp"
+		}
+		c, dialErr := o.d.DialContext(ctx, network, hostPort(host, port))
+		if dialErr == nil {
+			enableTCPNoDelay(c)
+		}
+		return c, dialErr
+	}
+
 	var lastErr error
-	for _, ip := range ips {
-		c, err := o.d.DialContext(ctx, "tcp", hostPort(ip.String(), port))
+	for i, ip := range ips {
+		attemptCtx := ctx
+		var cancel context.CancelFunc
+		// 多候选 IP 时对前序节点设置 2s 快速故障切换，避免单个黑洞 IP 拖慢首屏
+		if i < len(ips)-1 {
+			attemptCtx, cancel = context.WithTimeout(ctx, 2*time.Second)
+		}
+		c, err := o.d.DialContext(attemptCtx, "tcp", hostPort(ip.String(), port))
+		if cancel != nil {
+			cancel()
+		}
 		if err == nil {
+			enableTCPNoDelay(c)
 			return c, nil
 		}
 		lastErr = err
+		if ctx.Err() != nil {
+			break
+		}
 	}
 	return nil, lastErr
 }
@@ -330,7 +445,7 @@ func (c *bufConn) CloseWrite() error {
 	return nil
 }
 
-// unwrapTCPConn 尝试解包到底层 *net.TCPConn 以便利用 Linux splice(2) 零拷贝
+// unwrapTCPConn 仅解包明文透传的 *net.TCPConn 以便利用 Linux splice(2) 零拷贝（绝不穿透 TLS/加密层）
 func unwrapTCPConn(c net.Conn) (*net.TCPConn, *bufio.Reader) {
 	if bc, ok := c.(*bufConn); ok {
 		if tc, ok := bc.Conn.(*net.TCPConn); ok {
@@ -343,22 +458,35 @@ func unwrapTCPConn(c net.Conn) (*net.TCPConn, *bufio.Reader) {
 	return nil, nil
 }
 
-// relay 在 a 与 b 两个连接之间高性能双向转发
-// 核心优化：
-// 1. 批量超时刷新（Batch Deadline Updates）：减少 99.9% 的 SetDeadline 系统调用与 timer 锁争用
-// 2. 尝试解包底层 TCPConn 触发内核零拷贝 splice
-// 3. sync.Pool 32KB 缓冲复用
+// enableTCPNoDelay 穿透外层协议包装，为底层 TCP 套接字开启 TCP_NODELAY 降低首包交互延迟
+func enableTCPNoDelay(c net.Conn) {
+	for c != nil {
+		switch v := c.(type) {
+		case *net.TCPConn:
+			_ = v.SetNoDelay(true)
+			return
+		case *tls.Conn:
+			c = v.NetConn()
+		case *bufConn:
+			c = v.Conn
+		case *wsConn:
+			c = v.Conn
+		case *ssConn:
+			c = v.Conn
+		default:
+			return
+		}
+	}
+}
+
+// relay 在 a 与 b 两个连接之间安全、高性能双向转发
+// 严格等待双侧读写协程完全退出后才返回，确保外层 defer releaseReader(br) 绝不发生并发数据竞争
 func relay(a, b net.Conn, idle time.Duration) {
 	defer a.Close()
 	defer b.Close()
 
-	// 开启 TCP_NODELAY 降低交互延迟
-	if ta, _ := unwrapTCPConn(a); ta != nil {
-		_ = ta.SetNoDelay(true)
-	}
-	if tb, _ := unwrapTCPConn(b); tb != nil {
-		_ = tb.SetNoDelay(true)
-	}
+	enableTCPNoDelay(a)
+	enableTCPNoDelay(b)
 
 	done := make(chan error, 2)
 
@@ -380,7 +508,7 @@ func relay(a, b net.Conn, idle time.Duration) {
 
 		rawSrc, r := unwrapTCPConn(src)
 		rawDst, _ := unwrapTCPConn(dst)
-		// 零拷贝通道：当双方均为底层 TCP 套接字且已无预读残留时，触发 Linux splice(2) 直接内核管道转发
+		// 零拷贝通道：仅当双方均为明文底层 TCP 套接字且无预读残留时，触发 Linux splice(2)
 		if rawSrc != nil && rawDst != nil && (r == nil || r.Buffered() == 0) {
 			_ = rawSrc.SetReadDeadline(time.Time{})
 			_ = rawDst.SetWriteDeadline(time.Time{})
@@ -440,7 +568,11 @@ func relay(a, b net.Conn, idle time.Duration) {
 	go cp(a, b, &stats.BytesDown)
 
 	if err := <-done; err != nil {
-		return
+		// 任一侧异常中断时立即唤醒并终止另一侧阻塞的读写，等待双协程全部安全退出后再释放调用栈资源
+		_ = a.SetDeadline(time.Now())
+		_ = b.SetDeadline(time.Now())
+		_ = a.Close()
+		_ = b.Close()
 	}
 	<-done
 }

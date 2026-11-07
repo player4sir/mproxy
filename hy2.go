@@ -1,17 +1,22 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"context"
+	"crypto/subtle"
 	"crypto/tls"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
 	"net"
 	"net/netip"
 	"strconv"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/quic-go/quic-go"
@@ -37,10 +42,12 @@ type hy2Handler struct {
 }
 
 func newHy2Handler(lc ListenerConfig, out *Outbound, g *Guard, lim Limits, udpMgr *UDPManager) *hy2Handler {
-	pw := ""
+	pw := lc.Password
 	masq := ""
 	if lc.Hy2 != nil {
-		pw = lc.Hy2.Password
+		if lc.Hy2.Password != "" {
+			pw = lc.Hy2.Password
+		}
 		masq = lc.Hy2.Masquerade
 	}
 	if pw == "" && len(lc.Passwords) > 0 {
@@ -77,8 +84,14 @@ func StartHy2Listener(ctx context.Context, lc ListenerConfig, out *Outbound, g *
 		MinVersion:     tls.VersionTLS13,
 	}
 
+	// 关键优化：
+	// 1. DisablePathMTUDiscovery: true 彻底杜绝 PPPoE / TUN / 跨网运营商丢弃 1452B 大包探测帧引发的拥塞窗口雪崩
+	// 2. MaxIncomingStreams: 4096 消除浏览器高并发打开多标签页时的流排队阻塞
 	quicCfg := &quic.Config{
 		EnableDatagrams:                true,
+		DisablePathMTUDiscovery:        true,
+		MaxIncomingStreams:             4096,
+		MaxIncomingUniStreams:          1024,
 		MaxIdleTimeout:                 lim.IdleTimeout.Duration,
 		KeepAlivePeriod:                15 * time.Second,
 		InitialStreamReceiveWindow:     8 * 1024 * 1024,
@@ -88,7 +101,6 @@ func StartHy2Listener(ctx context.Context, lc ListenerConfig, out *Outbound, g *
 		Allow0RTT:                      true,
 	}
 
-	// 手动创建 UDP 套接字并拉满内核读写缓冲区 (7MB)，防止 4K/8K 高速突发丢包
 	uAddr, err := net.ResolveUDPAddr("udp", lc.Listen)
 	if err != nil {
 		return nil, fmt.Errorf("resolve hy2 udp %s: %w", lc.Listen, err)
@@ -146,7 +158,7 @@ func StartHy2Listener(ctx context.Context, lc ListenerConfig, out *Outbound, g *
 						wg.Done()
 					}
 				}()
-				h.handleSession(ctx, sess)
+				h.handleSession(ctx, sess, ip)
 			}()
 		}
 	}()
@@ -162,7 +174,7 @@ func netIPToAddr(ip net.IP) netip.Addr {
 	return netip.Addr{}
 }
 
-// quicStreamConn 将 quic.Stream 包装为标准的 net.Conn 接口
+// quicStreamConn 将 quic.Stream 包装为完整的 net.Conn 接口
 type quicStreamConn struct {
 	quic.Stream
 	sess quic.Connection
@@ -180,14 +192,19 @@ func (c *quicStreamConn) CloseWrite() error {
 	return c.Stream.Close()
 }
 
+func (c *quicStreamConn) Close() error {
+	c.Stream.CancelRead(0)
+	return c.Stream.Close()
+}
+
 // handleSession 处理官方标准 Hysteria 2 协议会话
-func (h *hy2Handler) handleSession(ctx context.Context, sess quic.Connection) {
+func (h *hy2Handler) handleSession(ctx context.Context, sess quic.Connection, clientIP netip.Addr) {
 	defer sess.CloseWithError(0x00, "session closed")
 
-	// 0. 发送 HTTP/3 Control Stream 与 SETTINGS 帧 (RFC 9114 规范强制要求)
+	// 0. 发送 HTTP/3 Control Stream 与 SETTINGS 帧 (RFC 9114 规范要求，Dynamic Table = 0)
 	go func() {
 		if uni, err := sess.OpenUniStream(); err == nil {
-			_, _ = uni.Write([]byte{0x00, 0x04, 0x00}) // StreamType=0x00(Control), FrameType=0x04(SETTINGS), Length=0x00
+			_, _ = uni.Write([]byte{0x00, 0x04, 0x00})
 		}
 	}()
 
@@ -204,134 +221,154 @@ func (h *hy2Handler) handleSession(ctx context.Context, sess quic.Connection) {
 		}
 	}()
 
-	// 1. 等待客户端建立首条流进行认证 (HTTP/3 POST /auth 请求)
+	// 1. 等待首条双向流完成 HTTP/3 POST /auth 握手
 	authStream, err := sess.AcceptStream(ctx)
 	if err != nil {
 		return
 	}
+	_ = authStream.SetDeadline(time.Now().Add(h.lim.HandshakeTimeout.Duration))
 
-	peekBuf := make([]byte, 4096)
-	n, _ := authStream.Read(peekBuf)
-	// 注意：当客户端 POST /auth 无 Body 且随同 HEADERS 帧一起发送 FIN 时，
-	// quic-go 的 Read 会在首次调用同时返回 n > 0 与 err == io.EOF，此处仅检查 n == 0
-	if n == 0 {
+	authBR := acquireReader(authStream)
+	hdrs, h3Err := readH3Headers(authBR)
+	releaseReader(authBR)
+	if h3Err != nil {
 		_ = authStream.Close()
+		authStream.CancelRead(0)
 		return
 	}
+
 	go func() {
 		_, _ = io.Copy(io.Discard, authStream)
 	}()
 
-	reqData := peekBuf[:n]
 	authenticated := false
-
-	// "/auth" 的标准 RFC 7541 / RFC 9204 QPACK Huffman 编码字节序列
-	huffmanAuth := []byte{0x60, 0x77, 0x26, 0x7f}
+	gotAuth, hasAuth := hdrs["hysteria-auth"]
+	gotPath := hdrs[":path"]
 
 	if len(h.password) == 0 {
 		authenticated = true
-	} else if bytes.Contains(reqData, []byte(h.password)) {
-		authenticated = true
-	} else if bytes.Contains(reqData, huffmanAuth) || bytes.Contains(reqData, []byte("auth")) || (len(reqData) > 2 && reqData[0] == 0x01) {
-		// 兼容客户端使用 QPACK / Huffman 压缩传输 :path (/auth) 与 Hysteria-Auth 的情形
+	} else if hasAuth && subtle.ConstantTimeCompare([]byte(gotAuth), []byte(h.password)) == 1 && (gotPath == "" || gotPath == "/auth") {
 		authenticated = true
 	}
 
 	if !authenticated {
-		if ua, ok := sess.RemoteAddr().(*net.UDPAddr); ok {
-			h.guard.Fail(netIPToAddr(ua.IP))
+		// 仅当客户端显式携带了错误的 Hysteria-Auth 口令时才记为暴力破解失败；普通浏览器访问返回 HTTP/3 200 OK 伪装页
+		if hasAuth {
+			h.guard.Fail(clientIP)
 		}
+		writeH3Masquerade(authStream)
 		_ = authStream.Close()
 		return
 	}
 
-	// 官方 Hysteria 2 认证成功规范：服务端发送符合 RFC 9114 / RFC 9204 规范的标准 HTTP/3 响应帧
-	// 包含 :status: 233, hysteria-udp: true, hysteria-cc-rx: auto
+	h.guard.AuthSuccess(clientIP)
+	_ = authStream.SetDeadline(time.Time{})
+
+	// 官方 Hysteria 2 认证成功响应帧 (:status: 233, hysteria-udp: true, hysteria-cc-rx: auto)
 	qpackPayload := []byte{
 		0x00, 0x00, // QPACK Prefix: Required Insert Count = 0, Base = 0
-
-		// Header 1: :status = 233 (RFC 9204 QPACK Name Reference: 0x5f, Index=15+48=63 (:status), ValLen=3)
-		0x5f, 0x30, 0x03, '2', '3', '3',
-
-		// Header 2: hysteria-udp = true (RFC 9204 QPACK Literal Name: 0x27, NameLen=7+5=12, ValLen=4)
-		0x27, 0x05,
-		'h', 'y', 's', 't', 'e', 'r', 'i', 'a', '-', 'u', 'd', 'p',
-		0x04,
-		't', 'r', 'u', 'e',
-
-		// Header 3: hysteria-cc-rx = auto (RFC 9204 QPACK Literal Name: 0x27, NameLen=7+7=14, ValLen=4)
-		0x27, 0x07,
-		'h', 'y', 's', 't', 'e', 'r', 'i', 'a', '-', 'c', 'c', '-', 'r', 'x',
-		0x04,
-		'a', 'u', 't', 'o',
+		0x5f, 0x30, 0x03, '2', '3', '3', // :status = 233
+		0x27, 0x05, 'h', 'y', 's', 't', 'e', 'r', 'i', 'a', '-', 'u', 'd', 'p', 0x04, 't', 'r', 'u', 'e',
+		0x27, 0x07, 'h', 'y', 's', 't', 'e', 'r', 'i', 'a', '-', 'c', 'c', '-', 'r', 'x', 0x04, 'a', 'u', 't', 'o',
 	}
-	var frameHdr [2]byte
-	frameHdr[0] = 0x01 // HTTP/3 Frame Type: HEADERS
-	frameHdr[1] = byte(len(qpackPayload))
-	_, _ = authStream.Write(frameHdr[:])
-	_, _ = authStream.Write(qpackPayload)
+	respFrame := make([]byte, 0, 2+len(qpackPayload))
+	respFrame = append(respFrame, 0x01, byte(len(qpackPayload)))
+	respFrame = append(respFrame, qpackPayload...)
+	if _, err := authStream.Write(respFrame); err != nil {
+		_ = authStream.Close()
+		return
+	}
 	_ = authStream.Close()
 
-	// 2. 启动 UDP 数据报（QUIC Datagram）中继处理
-	go h.handleDatagrams(ctx, sess)
+	// 2. 启动符合官方 Hysteria 2 规范的 QUIC Datagram UDP 中继（含分片与重组）
+	sessCtx, cancelSess := context.WithCancel(ctx)
+	defer cancelSess()
+	go h.handleDatagrams(sessCtx, sess)
 
-	// 3. 循环接收客户端的 TCP 代理请求流
+	// 3. 循环接收客户端的 TCP 代理请求流 (0x401)
 	for {
 		stream, err := sess.AcceptStream(ctx)
 		if err != nil {
 			return
 		}
-		go h.handleTCPStream(ctx, sess, stream)
+		go h.handleTCPStream(sessCtx, sess, stream)
 	}
 }
 
-// handleTCPStream 处理 Hysteria 2 标准 TCPRequest (0x401 报头)
-func (h *hy2Handler) handleTCPStream(ctx context.Context, sess quic.Connection, stream quic.Stream) {
-	defer func() {
-		_ = stream.Close()
-		stream.CancelRead(0)
-	}()
+// writeH3Masquerade 向主动探测者或普通 HTTP/3 浏览器返回标准的 200 OK HTML 响应帧
+func writeH3Masquerade(w io.Writer) {
+	qpackHdr := []byte{
+		0x00, 0x00, // QPACK Prefix
+		0xd9, // Indexed Static Table 25 -> :status = 200
+		0xf4, // Indexed Static Table 52 -> content-type = text/html; charset=utf-8
+	}
+	body := []byte(embeddedHTML)
+	var buf bytes.Buffer
+	buf.WriteByte(0x01) // Frame: HEADERS
+	buf = *bytes.NewBuffer(quicvarint.Append(buf.Bytes(), uint64(len(qpackHdr))))
+	buf.Write(qpackHdr)
+	buf.WriteByte(0x00) // Frame: DATA
+	raw := quicvarint.Append(buf.Bytes(), uint64(len(body)))
+	raw = append(raw, body...)
+	_, _ = w.Write(raw)
+}
 
-	vr := quicvarint.NewReader(stream)
-	// 读取 0x401 (TCPRequest) 标识符
-	reqID, err := quicvarint.Read(vr)
+// handleTCPStream 处理 Hysteria 2 标准 TCPRequest (0x401 报头)，统一使用带缓冲流避免首包字节丢失
+func (h *hy2Handler) handleTCPStream(ctx context.Context, sess quic.Connection, stream quic.Stream) {
+	sc := &quicStreamConn{Stream: stream, sess: sess}
+	defer sc.Close()
+
+	_ = stream.SetReadDeadline(time.Now().Add(h.lim.HandshakeTimeout.Duration))
+	br := acquireReader(stream)
+	defer releaseReader(br)
+
+	reqID, err := quicvarint.Read(br)
+	if err != nil {
+		return
+	}
+
 	var targetHost string
 	var targetPort int
 	isHy2Req := false
 
-	if err == nil && reqID == 0x401 {
+	if reqID == 0x401 {
 		isHy2Req = true
-		// 标准 Hysteria 2 协议流: [0x401] [addr_len] [addr_str] [padding_len] [padding]
-		addrLen, err := quicvarint.Read(vr)
-		if err != nil || addrLen == 0 || addrLen > 512 {
+		addrLen, err := quicvarint.Read(br)
+		if err != nil || addrLen == 0 || addrLen > 2048 {
 			return
 		}
 		addrBuf := make([]byte, addrLen)
-		if _, err := io.ReadFull(stream, addrBuf); err != nil {
+		if _, err := io.ReadFull(br, addrBuf); err != nil {
 			return
 		}
 
-		// 读取可能存在的 padding 字段
-		padLen, err := quicvarint.Read(vr)
-		if err == nil && padLen > 0 && padLen <= 65536 {
-			_, _ = io.CopyN(io.Discard, stream, int64(padLen))
+		padLen, err := quicvarint.Read(br)
+		if err != nil || padLen > 65536 {
+			return
+		}
+		if padLen > 0 {
+			if _, err := io.CopyN(io.Discard, br, int64(padLen)); err != nil {
+				return
+			}
 		}
 
 		addrStr := string(addrBuf)
-		if h, pStr, err := net.SplitHostPort(addrStr); err == nil {
-			targetHost = h
+		if host, pStr, err := net.SplitHostPort(addrStr); err == nil {
+			targetHost = host
 			targetPort, _ = strconv.Atoi(pStr)
 		} else {
 			targetHost = addrStr
 			targetPort = 80
 		}
 	} else {
-		// 兼容兜底：SOCKS5 地址流解析
-		targetHost, targetPort, err = readAddr(stream)
-		if err != nil {
-			return
-		}
+		return
 	}
+
+	if targetPort <= 0 || targetPort > 65535 {
+		return
+	}
+
+	_ = stream.SetReadDeadline(time.Time{})
 
 	dctx, cancel := context.WithTimeout(ctx, h.lim.HandshakeTimeout.Duration)
 	up, err := h.out.Dial(dctx, targetHost, targetPort)
@@ -346,69 +383,492 @@ func (h *hy2Handler) handleTCPStream(ctx context.Context, sess quic.Connection, 
 	defer up.Close()
 
 	if isHy2Req {
-		// 仅在出站拨号成功后才发送 Hysteria 2 官方 TCPResponse (0x00 OK)
+		// 发送 Hysteria 2 官方 TCPResponse: [Status=0x00(OK), MsgLen=0x00, PadLen=0x00]
 		if _, err := stream.Write([]byte{0x00, 0x00, 0x00}); err != nil {
 			return
 		}
 	}
 
-	streamConn := &quicStreamConn{Stream: stream, sess: sess}
-	relay(streamConn, up, h.lim.IdleTimeout.Duration)
+	relay(&bufConn{Conn: sc, r: br}, up, h.lim.IdleTimeout.Duration)
 }
 
-// handleDatagrams 处理基于 RFC 9221 QUIC Datagram 的 UDP 中继
+// ---------- Hysteria 2 官方 UDP Datagram 编解码与分片重组 ----------
+// 官方报文格式: [SessionID 4B] [PacketID 2B] [FragID 1B] [FragCount 1B] [quicvarint AddrLen] [Addr "host:port"] [Payload]
+
+type hy2DefragKey struct {
+	sessID uint32
+	pktID  uint16
+}
+
+type hy2DefragItem struct {
+	addr     string
+	chunks   [][]byte
+	received int
+	created  time.Time
+}
+
+func parseHy2UDP(msg []byte) (sessID uint32, pktID uint16, fragID, fragCount uint8, addr string, data []byte, ok bool) {
+	if len(msg) < 9 {
+		return 0, 0, 0, 0, "", nil, false
+	}
+	sessID = binary.BigEndian.Uint32(msg[0:4])
+	pktID = binary.BigEndian.Uint16(msg[4:6])
+	fragID = msg[6]
+	fragCount = msg[7]
+	if fragCount == 0 || fragID >= fragCount {
+		return 0, 0, 0, 0, "", nil, false
+	}
+	r := bytes.NewReader(msg[8:])
+	addrLen, err := quicvarint.Read(r)
+	if err != nil || addrLen == 0 || addrLen > 2048 || addrLen > uint64(r.Len()) {
+		return 0, 0, 0, 0, "", nil, false
+	}
+	varintLen := len(msg[8:]) - r.Len()
+	addrStart := 8 + varintLen
+	addrEnd := addrStart + int(addrLen)
+	if addrEnd > len(msg) {
+		return 0, 0, 0, 0, "", nil, false
+	}
+	addr = string(msg[addrStart:addrEnd])
+	data = msg[addrEnd:]
+	return sessID, pktID, fragID, fragCount, addr, data, true
+}
+
+func encodeHy2UDPFrames(sessID uint32, pktID uint16, addr string, payload []byte, maxSize int) [][]byte {
+	addrBytes := []byte(addr)
+	varintLen := quicvarint.Len(uint64(len(addrBytes)))
+	hdrLen := 8 + varintLen + len(addrBytes)
+	maxChunk := maxSize - hdrLen
+	if maxChunk < 128 {
+		maxChunk = 512
+	}
+
+	buildOne := func(fID, fCount uint8, chunk []byte) []byte {
+		pkt := make([]byte, 8, hdrLen+len(chunk))
+		binary.BigEndian.PutUint32(pkt[0:4], sessID)
+		binary.BigEndian.PutUint16(pkt[4:6], pktID)
+		pkt[6] = fID
+		pkt[7] = fCount
+		pkt = quicvarint.Append(pkt, uint64(len(addrBytes)))
+		pkt = append(pkt, addrBytes...)
+		pkt = append(pkt, chunk...)
+		return pkt
+	}
+
+	if len(payload) <= maxChunk {
+		return [][]byte{buildOne(0, 1, payload)}
+	}
+
+	totalFrags := (len(payload) + maxChunk - 1) / maxChunk
+	if totalFrags > 255 {
+		return nil
+	}
+	frames := make([][]byte, 0, totalFrags)
+	for i := 0; i < totalFrags; i++ {
+		start := i * maxChunk
+		end := start + maxChunk
+		if end > len(payload) {
+			end = len(payload)
+		}
+		frames = append(frames, buildOne(uint8(i), uint8(totalFrags), payload[start:end]))
+	}
+	return frames
+}
+
 func (h *hy2Handler) handleDatagrams(ctx context.Context, sess quic.Connection) {
+	connSeq := udpSeq.Add(1)
+	var pktSeq atomic.Uint32
+	var maxDgramSize atomic.Int32
+	maxDgramSize.Store(1120)
+
+	var keysMu sync.Mutex
+	activeKeys := make(map[string]struct{})
+	defer func() {
+		keysMu.Lock()
+		keys := make([]string, 0, len(activeKeys))
+		for k := range activeKeys {
+			keys = append(keys, k)
+		}
+		keysMu.Unlock()
+		for _, k := range keys {
+			h.udpMgr.RemoveSession(k)
+		}
+	}()
+
+	defrag := make(map[hy2DefragKey]*hy2DefragItem)
+
+	sendToClient := func(sID uint32, respHost string, respPort int, respPayload []byte) error {
+		pID := uint16(pktSeq.Add(1))
+		respAddr := hostPort(respHost, respPort)
+		curMax := int(maxDgramSize.Load())
+		frames := encodeHy2UDPFrames(sID, pID, respAddr, respPayload, curMax)
+		for _, f := range frames {
+			if err := sess.SendDatagram(f); err != nil {
+				var tooLarge *quic.DatagramTooLargeError
+				if errors.As(err, &tooLarge) && tooLarge.MaxDatagramPayloadSize > 128 {
+					newMax := int(tooLarge.MaxDatagramPayloadSize) - 8
+					maxDgramSize.Store(int32(newMax))
+					retryFrames := encodeHy2UDPFrames(sID, uint16(pktSeq.Add(1)), respAddr, respPayload, newMax)
+					for _, rf := range retryFrames {
+						if rerr := sess.SendDatagram(rf); rerr != nil {
+							return rerr
+						}
+					}
+					return nil
+				}
+				return err
+			}
+		}
+		return nil
+	}
+
 	for {
 		msg, err := sess.ReceiveDatagram(ctx)
 		if err != nil {
 			return
 		}
-		if len(msg) < 5 {
+
+		sessID, pktID, fragID, fragCount, addrStr, payload, ok := parseHy2UDP(msg)
+		if !ok {
 			continue
 		}
 
-		var sessID uint32
-		var addrBytes []byte
-		var isFragmented bool
-		var fragHeader []byte
-
-		// 检查是否包含分片包头: [PacketID 2B] [FragID 1B] [FragCount 1B] [SessionID 4B]
-		if len(msg) >= 12 && (msg[8] == 1 || msg[8] == 3 || msg[8] == 4) {
-			isFragmented = true
-			fragHeader = msg[:8]
-			sessID = binary.BigEndian.Uint32(msg[4:8])
-			addrBytes = msg[8:]
-		} else if len(msg) >= 8 {
-			// 标准非分片包头: [SessionID 4B] [Addr] [Payload]
-			sessID = binary.BigEndian.Uint32(msg[:4])
-			addrBytes = msg[4:]
-		} else {
-			continue
+		if fragCount > 1 {
+			now := time.Now()
+			if len(defrag) > 64 {
+				for k, v := range defrag {
+					if now.Sub(v.created) > 5*time.Second {
+						delete(defrag, k)
+					}
+				}
+				if len(defrag) > 128 {
+					clear(defrag)
+				}
+			}
+			dk := hy2DefragKey{sessID: sessID, pktID: pktID}
+			item, exists := defrag[dk]
+			if !exists || len(item.chunks) != int(fragCount) {
+				item = &hy2DefragItem{
+					addr:    addrStr,
+					chunks:  make([][]byte, fragCount),
+					created: now,
+				}
+				defrag[dk] = item
+			}
+			if item.chunks[fragID] == nil {
+				cp := make([]byte, len(payload))
+				copy(cp, payload)
+				item.chunks[fragID] = cp
+				item.received++
+			}
+			if item.received < int(fragCount) {
+				continue
+			}
+			payload = bytes.Join(item.chunks, nil)
+			addrStr = item.addr
+			delete(defrag, dk)
 		}
 
-		host, port, offset, err := parseAddrBytes(addrBytes)
+		host, pStr, err := net.SplitHostPort(addrStr)
 		if err != nil {
 			continue
 		}
-		payload := addrBytes[offset:]
+		port, err := strconv.Atoi(pStr)
+		if err != nil || port <= 0 || port > 65535 {
+			continue
+		}
 
-		clientKey := fmt.Sprintf("hy2:%s:%d", sess.RemoteAddr().String(), sessID)
+		clientKey := fmt.Sprintf("hy2:%d:%d", connSeq, sessID)
+		keysMu.Lock()
+		activeKeys[clientKey] = struct{}{}
+		keysMu.Unlock()
+
+		sID := sessID
 		_ = h.udpMgr.SendPacket(clientKey, host, port, payload, func(respHost string, respPort int, respPayload []byte) error {
-			respAddr, err := writeAddr(nil, respHost, respPort)
-			if err != nil {
-				return err
-			}
-			var packet []byte
-			if isFragmented {
-				packet = append(packet, fragHeader...)
-			} else {
-				var hdr [4]byte
-				binary.BigEndian.PutUint32(hdr[:], sessID)
-				packet = append(packet, hdr[:]...)
-			}
-			packet = append(packet, respAddr...)
-			packet = append(packet, respPayload...)
-			return sess.SendDatagram(packet)
+			return sendToClient(sID, respHost, respPort, respPayload)
 		})
 	}
+}
+
+// ---------- 纯标准库 HTTP/3 帧读取与 RFC 9204 QPACK / RFC 7541 Huffman 解码器 ----------
+
+func readH3Headers(br *bufio.Reader) (map[string]string, error) {
+	for i := 0; i < 16; i++ {
+		frameType, err := quicvarint.Read(br)
+		if err != nil {
+			return nil, err
+		}
+		frameLen, err := quicvarint.Read(br)
+		if err != nil {
+			return nil, err
+		}
+		if frameLen > 65536 {
+			return nil, errors.New("h3 frame exceeds limit")
+		}
+		if frameType == 0x01 { // HEADERS Frame
+			buf := make([]byte, frameLen)
+			if _, err := io.ReadFull(br, buf); err != nil {
+				return nil, err
+			}
+			return decodeQPACKHeaders(buf)
+		}
+		// 跳过 HTTP/3 GREASE 帧或其他扩展帧 (RFC 9114 §7.2.8)
+		if _, err := io.CopyN(io.Discard, br, int64(frameLen)); err != nil {
+			return nil, err
+		}
+	}
+	return nil, errors.New("h3 headers frame not found")
+}
+
+func readQPACKInt(b []byte, idx int, prefixBits uint) (uint64, int, bool) {
+	if idx >= len(b) {
+		return 0, idx, false
+	}
+	mask := uint64((1 << prefixBits) - 1)
+	val := uint64(b[idx]) & mask
+	idx++
+	if val < mask {
+		return val, idx, true
+	}
+	var shift uint
+	for idx < len(b) {
+		c := b[idx]
+		idx++
+		val += uint64(c&0x7f) << shift
+		if c&0x80 == 0 {
+			return val, idx, true
+		}
+		shift += 7
+		if shift > 56 {
+			return 0, idx, false
+		}
+	}
+	return 0, idx, false
+}
+
+func readQPACKStr(b []byte, idx int, prefixBits uint) (string, int, bool) {
+	if idx >= len(b) {
+		return "", idx, false
+	}
+	isHuff := (b[idx] & (1 << prefixBits)) != 0
+	sLen, nextIdx, ok := readQPACKInt(b, idx, prefixBits)
+	if !ok || sLen > 65536 || nextIdx+int(sLen) > len(b) {
+		return "", idx, false
+	}
+	raw := b[nextIdx : nextIdx+int(sLen)]
+	nextIdx += int(sLen)
+	if !isHuff {
+		return string(raw), nextIdx, true
+	}
+	s, err := huffmanDecode(raw)
+	if err != nil {
+		return "", idx, false
+	}
+	return s, nextIdx, true
+}
+
+func qpackStaticNameVal(idx int) (string, string) {
+	switch idx {
+	case 0:
+		return ":authority", ""
+	case 1:
+		return ":path", "/"
+	case 15:
+		return ":method", "CONNECT"
+	case 16:
+		return ":method", "DELETE"
+	case 17:
+		return ":method", "GET"
+	case 18:
+		return ":method", "HEAD"
+	case 19:
+		return ":method", "OPTIONS"
+	case 20:
+		return ":method", "POST"
+	case 21:
+		return ":method", "PUT"
+	case 22:
+		return ":scheme", "http"
+	case 23:
+		return ":scheme", "https"
+	default:
+		return "", ""
+	}
+}
+
+func decodeQPACKHeaders(b []byte) (map[string]string, error) {
+	_, idx, ok := readQPACKInt(b, 0, 8) // Required Insert Count
+	if !ok {
+		return nil, errors.New("qpack: invalid ric")
+	}
+	_, idx, ok = readQPACKInt(b, idx, 7) // Delta Base
+	if !ok {
+		return nil, errors.New("qpack: invalid base")
+	}
+
+	hdrs := make(map[string]string, 8)
+	for idx < len(b) {
+		first := b[idx]
+		switch {
+		case first&0x80 != 0: // 1 T Index(6+): Indexed Field Line
+			isStatic := (first & 0x40) != 0
+			tIdx, nextIdx, ok := readQPACKInt(b, idx, 6)
+			if !ok {
+				return hdrs, nil
+			}
+			idx = nextIdx
+			if isStatic {
+				if k, v := qpackStaticNameVal(int(tIdx)); k != "" {
+					hdrs[k] = v
+				}
+			}
+
+		case first&0xC0 == 0x40: // 01 N T NameIndex(4+) + Value(7+)
+			isStatic := (first & 0x10) != 0
+			nIdx, nextIdx, ok := readQPACKInt(b, idx, 4)
+			if !ok {
+				return hdrs, nil
+			}
+			val, nextIdx2, ok := readQPACKStr(b, nextIdx, 7)
+			if !ok {
+				return hdrs, nil
+			}
+			idx = nextIdx2
+			if isStatic {
+				if k, _ := qpackStaticNameVal(int(nIdx)); k != "" {
+					hdrs[k] = val
+				}
+			}
+
+		case first&0xE0 == 0x20: // 001 N H NameLen(3+) + Name + H ValLen(7+) + Value
+			name, nextIdx, ok := readQPACKStr(b, idx, 3)
+			if !ok {
+				return hdrs, nil
+			}
+			val, nextIdx2, ok := readQPACKStr(b, nextIdx, 7)
+			if !ok {
+				return hdrs, nil
+			}
+			idx = nextIdx2
+			hdrs[strings.ToLower(name)] = val
+
+		case first&0xF0 == 0x10: // 0001 Index(4+): Post-Base Indexed
+			_, nextIdx, ok := readQPACKInt(b, idx, 4)
+			if !ok {
+				return hdrs, nil
+			}
+			idx = nextIdx
+
+		default: // 0000 N Index(3+) + Value(7+): Post-Base Literal Name Ref
+			_, nextIdx, ok := readQPACKInt(b, idx, 3)
+			if !ok {
+				return hdrs, nil
+			}
+			_, nextIdx2, ok := readQPACKStr(b, nextIdx, 7)
+			if !ok {
+				return hdrs, nil
+			}
+			idx = nextIdx2
+		}
+	}
+	return hdrs, nil
+}
+
+type huffNode struct {
+	children [2]*huffNode
+	sym      byte
+	isLeaf   bool
+}
+
+var (
+	huffOnce sync.Once
+	huffRoot *huffNode
+)
+
+// RFC 7541 Appendix B 标准 Huffman 编码表（256 符号，与 QPACK RFC 9204 完全一致）
+var rfc7541HuffmanTable = [256]struct {
+	code uint32
+	bits uint8
+}{
+	{0x1ff8, 13}, {0x7fffd8, 23}, {0xfffffe2, 28}, {0xfffffe3, 28}, {0xfffffe4, 28}, {0xfffffe5, 28}, {0xfffffe6, 28}, {0xfffffe7, 28},
+	{0xfffffe8, 28}, {0xffffea, 24}, {0x3ffffffc, 30}, {0xfffffe9, 28}, {0xfffffea, 28}, {0x3ffffffd, 30}, {0xfffffeb, 28}, {0xfffffec, 28},
+	{0xfffffed, 28}, {0xfffffee, 28}, {0xfffffef, 28}, {0xffffff0, 28}, {0xffffff1, 28}, {0xffffff2, 28}, {0x3ffffffe, 30}, {0xffffff3, 28},
+	{0xffffff4, 28}, {0xffffff5, 28}, {0xffffff6, 28}, {0xffffff7, 28}, {0xffffff8, 28}, {0xffffff9, 28}, {0xffffffa, 28}, {0xffffffb, 28},
+	{0x14, 6}, {0x3f8, 10}, {0x3f9, 10}, {0xffa, 12}, {0x1ff9, 13}, {0x15, 6}, {0xf8, 8}, {0x7fa, 11},
+	{0x3fa, 10}, {0x3fb, 10}, {0xf9, 8}, {0x7fb, 11}, {0xfa, 8}, {0x16, 6}, {0x17, 6}, {0x18, 6},
+	{0x0, 5}, {0x1, 5}, {0x2, 5}, {0x19, 6}, {0x1a, 6}, {0x1b, 6}, {0x1c, 6}, {0x1d, 6},
+	{0x1e, 6}, {0x1f, 6}, {0x5c, 7}, {0xfb, 8}, {0x7ffc, 15}, {0x20, 6}, {0xffb, 12}, {0x3fc, 10},
+	{0x1ffa, 13}, {0x21, 6}, {0x5d, 7}, {0x5e, 7}, {0x5f, 7}, {0x60, 7}, {0x61, 7}, {0x62, 7},
+	{0x63, 7}, {0x64, 7}, {0x65, 7}, {0x66, 7}, {0x67, 7}, {0x68, 7}, {0x69, 7}, {0x6a, 7},
+	{0x6b, 7}, {0x6c, 7}, {0x6d, 7}, {0x6e, 7}, {0x6f, 7}, {0x70, 7}, {0x71, 7}, {0x72, 7},
+	{0xfc, 8}, {0x73, 7}, {0xfd, 8}, {0x1ffb, 13}, {0x7fff0, 19}, {0x1ffc, 13}, {0x3ffc, 14}, {0x22, 6},
+	{0x7ffd, 15}, {0x3, 5}, {0x23, 6}, {0x4, 5}, {0x24, 6}, {0x5, 5}, {0x25, 6}, {0x26, 6},
+	{0x27, 6}, {0x6, 5}, {0x74, 7}, {0x75, 7}, {0x28, 6}, {0x29, 6}, {0x2a, 6}, {0x7, 5},
+	{0x2b, 6}, {0x76, 7}, {0x2c, 6}, {0x8, 5}, {0x9, 5}, {0x2d, 6}, {0x77, 7}, {0x78, 7},
+	{0x79, 7}, {0x7a, 7}, {0x7b, 7}, {0x7ffe, 15}, {0x7fc, 11}, {0x3ffd, 14}, {0x1ffd, 13}, {0xffffffc, 28},
+	{0xfffe6, 20}, {0x3fffd2, 22}, {0xfffe7, 20}, {0xfffe8, 20}, {0x3fffd3, 22}, {0x3fffd4, 22}, {0x3fffd5, 22}, {0x7fffd9, 23},
+	{0x3fffd6, 22}, {0x7fffda, 23}, {0x7fffdb, 23}, {0x7fffdc, 23}, {0x7fffdd, 23}, {0x7fffde, 23}, {0xffffeb, 24}, {0x7fffdf, 23},
+	{0xffffec, 24}, {0xffffed, 24}, {0x3fffd7, 22}, {0x7fffe0, 23}, {0xffffee, 24}, {0x7fffe1, 23}, {0x7fffe2, 23}, {0x7fffe3, 23},
+	{0x7fffe4, 23}, {0x1fffdc, 21}, {0x3fffd8, 22}, {0x7fffe5, 23}, {0x3fffd9, 22}, {0x7fffe6, 23}, {0x7fffe7, 23}, {0xffffef, 24},
+	{0x3fffda, 22}, {0x1fffdd, 21}, {0xfffe9, 20}, {0x3fffdb, 22}, {0x3fffdc, 22}, {0x7fffe8, 23}, {0x7fffe9, 23}, {0x1fffde, 21},
+	{0x7fffea, 23}, {0x3fffdd, 22}, {0x3fffde, 22}, {0xfffff0, 24}, {0x1fffdf, 21}, {0x3fffdf, 22}, {0x7fffeb, 23}, {0x7fffec, 23},
+	{0x1fffe0, 21}, {0x1fffe1, 21}, {0x3fffe0, 22}, {0x1fffe2, 21}, {0x7fffed, 23}, {0x3fffe1, 22}, {0x7fffee, 23}, {0x7fffef, 23},
+	{0xfffea, 20}, {0x3fffe2, 22}, {0x3fffe3, 22}, {0x3fffe4, 22}, {0x7ffff0, 23}, {0x3fffe5, 22}, {0x3fffe6, 22}, {0x7ffff1, 23},
+	{0x3ffffe0, 26}, {0x3ffffe1, 26}, {0xfffeb, 20}, {0x7fff1, 19}, {0x3fffe7, 22}, {0x7ffff2, 23}, {0x3fffe8, 22}, {0x1ffffec, 25},
+	{0x3ffffe2, 26}, {0x3ffffe3, 26}, {0x3ffffe4, 26}, {0x7ffffde, 27}, {0x7ffffdf, 27}, {0x3ffffe5, 26}, {0xfffff1, 24}, {0x1ffffed, 25},
+	{0x7fff2, 19}, {0x1fffe3, 21}, {0x3ffffe6, 26}, {0x7ffffe0, 27}, {0x7ffffe1, 27}, {0x3ffffe7, 26}, {0x7ffffe2, 27}, {0xfffff2, 24},
+	{0x1fffe4, 21}, {0x1fffe5, 21}, {0x3ffffe8, 26}, {0x3ffffe9, 26}, {0xffffffd, 28}, {0x7ffffe3, 27}, {0x7ffffe4, 27}, {0x7ffffe5, 27},
+	{0xfffec, 20}, {0xfffff3, 24}, {0xfffed, 20}, {0x1fffe6, 21}, {0x3fffe9, 22}, {0x1fffe7, 21}, {0x1fffe8, 21}, {0x7ffff3, 23},
+	{0x3fffea, 22}, {0x3fffeb, 22}, {0x1ffffee, 25}, {0x1ffffef, 25}, {0xfffff4, 24}, {0xfffff5, 24}, {0x3ffffea, 26}, {0x7ffff4, 23},
+	{0x3ffffeb, 26}, {0x7ffffe6, 27}, {0x3ffffec, 26}, {0x3ffffed, 26}, {0x7ffffe7, 27}, {0x7ffffe8, 27}, {0x7ffffe9, 27}, {0x7ffffea, 27},
+	{0x7ffffeb, 27}, {0xffffffe, 28}, {0x7ffffec, 27}, {0x7ffffed, 27}, {0x7ffffee, 27}, {0x7ffffef, 27}, {0x7fffff0, 27}, {0x3ffffee, 26},
+}
+
+func initHuffmanTrie() {
+	root := &huffNode{}
+	for sym, entry := range rfc7541HuffmanTable {
+		cur := root
+		for bitPos := int(entry.bits) - 1; bitPos >= 0; bitPos-- {
+			b := (entry.code >> uint(bitPos)) & 1
+			if cur.children[b] == nil {
+				cur.children[b] = &huffNode{}
+			}
+			cur = cur.children[b]
+		}
+		cur.sym = byte(sym)
+		cur.isLeaf = true
+	}
+	huffRoot = root
+}
+
+func huffmanDecode(src []byte) (string, error) {
+	huffOnce.Do(initHuffmanTrie)
+	out := make([]byte, 0, len(src)*2)
+	cur := huffRoot
+	var padBits int
+	var allOnes = true
+
+	for _, b := range src {
+		for shift := 7; shift >= 0; shift-- {
+			bit := (b >> uint(shift)) & 1
+			cur = cur.children[bit]
+			if cur == nil {
+				return "", errors.New("invalid huffman sequence")
+			}
+			if bit == 0 {
+				allOnes = false
+			}
+			padBits++
+			if cur.isLeaf {
+				out = append(out, cur.sym)
+				cur = huffRoot
+				padBits = 0
+				allOnes = true
+			}
+		}
+	}
+	if padBits > 7 || !allOnes {
+		return "", errors.New("invalid huffman padding")
+	}
+	return string(out), nil
 }

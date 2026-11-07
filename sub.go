@@ -73,6 +73,7 @@ func GenerateClientConfigs(cfg *Config, opt ExportOptions) string {
 	var rawLinks []string
 	var clashProxies []map[string]any
 	var singboxOutbounds []map[string]any
+	globalTLS := findGlobalTLS(cfg)
 
 	for i, l := range cfg.Listeners {
 		_, pStr, _ := net.SplitHostPort(l.Listen)
@@ -177,13 +178,18 @@ func GenerateClientConfigs(cfg *Config, opt ExportOptions) string {
 				secParam := "none"
 				isTLS := false
 				skipVerify := true
-				if l.TLS != nil {
+				sni := safeSNI(host)
+				effectiveTLS := l.TLS
+				if effectiveTLS == nil {
+					effectiveTLS = globalTLS
+				}
+				if effectiveTLS != nil {
 					isTLS = true
-					if isTrustedCertForHost(l.TLS.Cert, host) {
-						secParam = "tls"
+					if isTrustedCertForHost(effectiveTLS.Cert, host) {
+						secParam = fmt.Sprintf("tls&sni=%s&fp=chrome&alpn=http%%2F1.1", sni)
 						skipVerify = false
 					} else {
-						secParam = "tls&allowInsecure=1"
+						secParam = fmt.Sprintf("tls&allowInsecure=1&sni=%s&fp=chrome&alpn=http%%2F1.1", sni)
 					}
 				}
 
@@ -201,10 +207,10 @@ func GenerateClientConfigs(cfg *Config, opt ExportOptions) string {
 					"network":    "ws",
 					"tls":        isTLS,
 					"udp":        true,
-					"servername": domain,
+					"servername": sni,
 					"ws-opts": map[string]any{
-						"path":                wsPath,
-						"max-early-data":      2048,
+						"path":                   wsPath,
+						"max-early-data":         2048,
 						"early-data-header-name": "Sec-WebSocket-Protocol",
 						"headers": map[string]any{
 							"Host": domain,
@@ -213,6 +219,7 @@ func GenerateClientConfigs(cfg *Config, opt ExportOptions) string {
 				}
 				if isTLS {
 					clashNode["skip-cert-verify"] = skipVerify
+					clashNode["alpn"] = []string{"http/1.1"}
 				}
 				clashProxies = append(clashProxies, clashNode)
 
@@ -223,9 +230,9 @@ func GenerateClientConfigs(cfg *Config, opt ExportOptions) string {
 					"server_port": port,
 					"uuid":        uuid,
 					"transport": map[string]any{
-						"type":                "ws",
-						"path":                wsPath,
-						"max_early_data":      2048,
+						"type":                   "ws",
+						"path":                   wsPath,
+						"max_early_data":         2048,
 						"early_data_header_name": "Sec-WebSocket-Protocol",
 						"headers": map[string]any{
 							"Host": domain,
@@ -235,8 +242,9 @@ func GenerateClientConfigs(cfg *Config, opt ExportOptions) string {
 				if isTLS {
 					sbNode["tls"] = map[string]any{
 						"enabled":     true,
-						"server_name": domain,
+						"server_name": sni,
 						"insecure":    skipVerify,
+						"alpn":        []string{"http/1.1"},
 					}
 				}
 				singboxOutbounds = append(singboxOutbounds, sbNode)
@@ -255,7 +263,7 @@ func GenerateClientConfigs(cfg *Config, opt ExportOptions) string {
 				rawLinks = append(rawLinks, link)
 
 				// 额外输出 443 单端口复用的 VLESS-WSS 节点（可供开启 Cloudflare 小黄云 443 端口直接使用）
-				wssLink := fmt.Sprintf("vless://%s@%s:%d?encryption=none&security=tls%s&sni=%s&fp=chrome&type=ws&host=%s&path=%s#mproxy-VLESS-WSS-443",
+				wssLink := fmt.Sprintf("vless://%s@%s:%d?encryption=none&security=tls%s&sni=%s&fp=chrome&alpn=http%%2F1.1&type=ws&host=%s&path=%s#mproxy-VLESS-WSS-443",
 					uuid, host, port, insecParam, sni, sni, url.QueryEscape("/vless-ws?ed=2048"))
 				sb.WriteString(fmt.Sprintf("[VLESS WSS 443 节点 (支持开启 Cloudflare 橙色云)]\n%s\n\n", wssLink))
 				rawLinks = append(rawLinks, wssLink)
@@ -301,12 +309,12 @@ func GenerateClientConfigs(cfg *Config, opt ExportOptions) string {
 			if trusted {
 				insecVal = 0
 			}
-			// 输出直连节点与端口跳跃节点
-			directLink := fmt.Sprintf("hysteria2://%s@%s:%d?sni=%s&insecure=%d#mproxy-Hysteria2", pw, host, port, sni, insecVal)
+			// 输出直连节点与端口跳跃节点（显式携带 alpn=h3 确保双内核握手一致）
+			directLink := fmt.Sprintf("hysteria2://%s@%s:%d?sni=%s&alpn=h3&insecure=%d#mproxy-Hysteria2", pw, host, port, sni, insecVal)
 			sb.WriteString(fmt.Sprintf("[Hysteria 2 节点 (直连极速抗丢包)]\n%s\n\n", directLink))
 			rawLinks = append(rawLinks, directLink)
 
-			hopLink := fmt.Sprintf("hysteria2://%s@%s:%d?sni=%s&insecure=%d&mport=20000-50000#mproxy-Hysteria2-PortHopping", pw, host, port, sni, insecVal)
+			hopLink := fmt.Sprintf("hysteria2://%s@%s:%d?sni=%s&alpn=h3&insecure=%d&mport=20000-50000#mproxy-Hysteria2-PortHopping", pw, host, port, sni, insecVal)
 			sb.WriteString(fmt.Sprintf("[Hysteria 2 端口跳跃节点 (20000-50000)]\n%s\n\n", hopLink))
 			rawLinks = append(rawLinks, hopLink)
 
@@ -318,6 +326,7 @@ func GenerateClientConfigs(cfg *Config, opt ExportOptions) string {
 				"ports":            "20000-50000",
 				"password":         pw,
 				"sni":              sni,
+				"alpn":             []string{"h3"},
 				"skip-cert-verify": !trusted,
 			})
 
@@ -331,6 +340,7 @@ func GenerateClientConfigs(cfg *Config, opt ExportOptions) string {
 				"tls": map[string]any{
 					"enabled":     true,
 					"server_name": sni,
+					"alpn":        []string{"h3"},
 					"insecure":    !trusted,
 				},
 			})

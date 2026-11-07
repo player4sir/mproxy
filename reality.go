@@ -272,7 +272,6 @@ func (h *realityHandler) handle(ctx context.Context, c net.Conn) {
 	client := &bufConn{Conn: c, r: br}
 	tc := tls.Server(client, h.tlsCfg)
 	if err := tc.Handshake(); err != nil {
-		h.guard.Fail(ip)
 		slog.Debug("tls handshake failed", "remote", ip, "err", err)
 		return
 	}

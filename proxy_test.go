@@ -2,22 +2,22 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
-	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/base64"
 	"encoding/binary"
-	"encoding/hex"
 	"encoding/pem"
-	"fmt"
 	"io"
 	"math/big"
 	"net"
 	"net/http"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"strings"
@@ -569,5 +569,261 @@ func TestEmbeddedFallback(t *testing.T) {
 	}
 	if !strings.Contains(string(resp), "200 OK") || !strings.Contains(string(resp), "Edge Node Gateway") {
 		t.Fatalf("unexpected fallback response: %s", string(resp))
+	}
+}
+
+func TestVLESSFragmentedWSSUpgrade(t *testing.T) {
+	echoTCP := startEchoTCP(t)
+	lim := testLimits()
+	out := newOut(t)
+	certFile, keyFile := selfSigned(t)
+
+	fbLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	fbAddr := fbLn.Addr().String()
+	_ = fbLn.Close()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	_ = StartEmbeddedFallback(ctx, fbAddr)
+
+	testUUID := "a5e18239-6523-446f-b258-2e06180632a7"
+	vh, err := newVLESSHandler(ListenerConfig{
+		Passwords: []string{testUUID},
+		Fallback:  fbAddr,
+	}, out, NewGuard(lim), lim, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	cl, _ := newCertLoader(certFile, keyFile)
+	tlsCfg := &tls.Config{
+		GetCertificate: cl.get,
+		NextProtos:     []string{"http/1.1"},
+	}
+	srv := startServer(t, func(ctx context.Context, c net.Conn) {
+		tc := tls.Server(c, tlsCfg)
+		if err := tc.Handshake(); err != nil {
+			return
+		}
+		vh.handle(ctx, tc)
+	}, lim)
+
+	tlsClient, err := tls.Dial("tcp", srv, &tls.Config{InsecureSkipVerify: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tlsClient.Close()
+
+	// 构造 VLESS 头 + 1800B 大首包模拟 TLS 1.3 Post-Quantum ClientHello (?ed=2048)
+	uBytes, _ := parseUUID(testUUID)
+	h, p, _ := net.SplitHostPort(echoTCP)
+	var pn int
+	for _, ch := range p {
+		pn = pn*10 + int(ch-'0')
+	}
+	var portB [2]byte
+	binary.BigEndian.PutUint16(portB[:], uint16(pn))
+
+	bigMsg := strings.Repeat("Q", 1600)
+	vlessEarly := []byte{0x00}
+	vlessEarly = append(vlessEarly, uBytes[:]...)
+	vlessEarly = append(vlessEarly, 0x00, 0x01, portB[0], portB[1], 0x01)
+	vlessEarly = append(vlessEarly, net.ParseIP(h).To4()...)
+	vlessEarly = append(vlessEarly, []byte(bigMsg)...)
+
+	b64ED := base64.RawURLEncoding.EncodeToString(vlessEarly)
+	fullReq := "GET /vless-ws HTTP/1.1\r\n" +
+		"Host: localhost\r\n" +
+		"Sec-WebSocket-Protocol: " + b64ED + "\r\n" +
+		"Upgrade: websocket\r\n" +
+		"Connection: Upgrade\r\n" +
+		"Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n" +
+		"Sec-WebSocket-Version: 13\r\n\r\n"
+
+	// 故意拆成 3 个独立 TLS Record 发送，模拟真实跨包分片场景
+	_, _ = tlsClient.Write([]byte(fullReq[:512]))
+	time.Sleep(10 * time.Millisecond)
+	_, _ = tlsClient.Write([]byte(fullReq[512:1500]))
+	time.Sleep(10 * time.Millisecond)
+	_, _ = tlsClient.Write([]byte(fullReq[1500:]))
+
+	br := bufio.NewReader(tlsClient)
+	resp, err := http.ReadResponse(br, nil)
+	if err != nil || resp.StatusCode != 101 {
+		t.Fatalf("fragmented wss upgrade failed: err=%v, status=%v", err, resp)
+	}
+
+	// 读取服务端返回的 WebSocket 帧（包含 [0x00, 0x00] VLESS 头 + bigMsg 回显）
+	var got []byte
+	for len(got) < 2+len(bigMsg) {
+		var hdr [2]byte
+		if _, err := io.ReadFull(br, hdr[:]); err != nil {
+			t.Fatalf("read ws frame hdr: %v", err)
+		}
+		plen := int(hdr[1] & 0x7F)
+		if plen == 126 {
+			var s [2]byte
+			_, _ = io.ReadFull(br, s[:])
+			plen = int(binary.BigEndian.Uint16(s[:]))
+		}
+		chunk := make([]byte, plen)
+		if _, err := io.ReadFull(br, chunk); err != nil {
+			t.Fatalf("read ws frame body: %v", err)
+		}
+		got = append(got, chunk...)
+	}
+	if string(got[2:]) != bigMsg {
+		t.Fatalf("early data echo mismatch: len=%d", len(got))
+	}
+}
+
+func TestVLESSXUDP(t *testing.T) {
+	_, echoUDP := startEchoUDP(t)
+	lim := testLimits()
+	out := newOut(t)
+	udpMgr := NewUDPManager(out, 5*time.Second)
+	t.Cleanup(func() { udpMgr.Close() })
+
+	testUUID := "a5e18239-6523-446f-b258-2e06180632a7"
+	vh, err := newVLESSHandler(ListenerConfig{Passwords: []string{testUUID}}, out, NewGuard(lim), lim, udpMgr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := startServer(t, vh.handle, lim)
+
+	c, err := net.Dial("tcp", srv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+
+	uBytes, _ := parseUUID(testUUID)
+	h, p, _ := net.SplitHostPort(echoUDP)
+	var pn int
+	for _, ch := range p {
+		pn = pn*10 + int(ch-'0')
+	}
+
+	// VLESS XUDP 头: [0x00] [UUID 16B] [AddonLen 0x00] [Cmd 0x03]
+	vlessHdr := append([]byte{0x00}, uBytes[:]...)
+	vlessHdr = append(vlessHdr, 0x00, 0x03)
+
+	// XUDP New Frame: [MetaLen 2B] [SessID=1(2B), Status=0x01(New), Opt=0x01(Data), Net=0x02(UDP), Port(2B), ATYP=1, IPv4(4B), GlobalID(8B)] [PayloadLen 2B] [Payload]
+	meta := []byte{0x00, 0x01, 0x01, 0x01, 0x02}
+	meta = appendVLESSAddr(meta, h, pn)
+	meta = append(meta, make([]byte, 8)...) // 8-byte GlobalID
+	msg := []byte("hello xudp dns")
+
+	var pkt bytes.Buffer
+	pkt.Write(vlessHdr)
+	_ = binary.Write(&pkt, binary.BigEndian, uint16(len(meta)))
+	pkt.Write(meta)
+	_ = binary.Write(&pkt, binary.BigEndian, uint16(len(msg)))
+	pkt.Write(msg)
+
+	if _, err := c.Write(pkt.Bytes()); err != nil {
+		t.Fatal(err)
+	}
+
+	_ = c.SetDeadline(time.Now().Add(3 * time.Second))
+	var vResp [2]byte
+	if _, err := io.ReadFull(c, vResp[:]); err != nil || vResp != [2]byte{0, 0} {
+		t.Fatalf("xudp vless resp err: %v, %v", err, vResp)
+	}
+
+	var rMetaLen uint16
+	if err := binary.Read(c, binary.BigEndian, &rMetaLen); err != nil {
+		t.Fatalf("read xudp resp meta len: %v", err)
+	}
+	rMeta := make([]byte, rMetaLen)
+	if _, err := io.ReadFull(c, rMeta); err != nil {
+		t.Fatal(err)
+	}
+	var rPayLen uint16
+	if err := binary.Read(c, binary.BigEndian, &rPayLen); err != nil {
+		t.Fatal(err)
+	}
+	rPay := make([]byte, rPayLen)
+	if _, err := io.ReadFull(c, rPay); err != nil {
+		t.Fatal(err)
+	}
+	if string(rPay) != string(msg) {
+		t.Fatalf("xudp payload mismatch: got %q, want %q", rPay, msg)
+	}
+}
+
+func TestHy2UDPCodecAndQPACKAuth(t *testing.T) {
+	// 1. 验证 Hysteria 2 官方 UDP 分片与重组编解码
+	bigPayload := bytes.Repeat([]byte("HY2UDP!"), 400) // 2800B > 1100B
+	frames := encodeHy2UDPFrames(42, 7, "8.8.8.8:53", bigPayload, 1100)
+	if len(frames) < 3 {
+		t.Fatalf("expected >=3 fragments, got %d", len(frames))
+	}
+	var reassembled []byte
+	for i, f := range frames {
+		sID, pID, fID, fCnt, addr, data, ok := parseHy2UDP(f)
+		if !ok || sID != 42 || pID != 7 || int(fID) != i || int(fCnt) != len(frames) || addr != "8.8.8.8:53" {
+			t.Fatalf("parseHy2UDP mismatch on frag %d: ok=%v sID=%d pID=%d fID=%d/%d addr=%q", i, ok, sID, pID, fID, fCnt, addr)
+		}
+		reassembled = append(reassembled, data...)
+	}
+	if !bytes.Equal(reassembled, bigPayload) {
+		t.Fatal("reassembled hy2 udp payload mismatch")
+	}
+
+	// 2. 验证带 GREASE 帧 + RFC 7541 Huffman 编码的 QPACK /auth 解码
+	// GREASE frame: type=0x21 (33), len=3, payload="abc"
+	// HEADERS frame: type=0x01, QPACK:
+	//   0x00, 0x00 (Prefix)
+	//   0xd4 (:method = POST, static 20)
+	//   0x51, 0x84, 0x60, 0x76, 0xa6, 0x7f (:path = "/auth" Huffman)
+	//   0x2f, 0x02, 0x9f, 0xd2, 0x12, 0x5b, 0x0c, 0x35, 0x87, 0x6a, 0x67 (Name "hysteria-auth" Huffman 9B: 0x20|0x08|0x07=0x2f, +2=9)
+	//   0x8e, 0x3e, 0x2f, 0xcf, 0xdd, 0x9d, 0x7a, 0x61, 0xc7, 0xcf, 0xc4, 0xd8, 0xb8, 0x79, 0xf7 (Val "oGXZQkjFHYwgGUxz" Huffman 14B: 0x80|14=0x8e)
+	qpackBlock := []byte{
+		0x00, 0x00,
+		0xd4,
+		0x51, 0x84, 0x60, 0x76, 0xa6, 0x7f,
+		0x2f, 0x02, 0x9f, 0xd2, 0x12, 0x5b, 0x0c, 0x35, 0x87, 0x6a, 0x67,
+		0x8e, 0x3e, 0x2f, 0xcf, 0xdd, 0x9d, 0x7a, 0x61, 0xc7, 0xcf, 0xc4, 0xd8, 0xb8, 0x79, 0xf7,
+	}
+	streamBytes := []byte{0x21, 0x03, 'a', 'b', 'c', 0x01, byte(len(qpackBlock))}
+	streamBytes = append(streamBytes, qpackBlock...)
+
+	hdrs, err := readH3Headers(bufio.NewReader(bytes.NewReader(streamBytes)))
+	if err != nil {
+		t.Fatalf("readH3Headers failed: %v", err)
+	}
+	if hdrs[":method"] != "POST" || hdrs[":path"] != "/auth" || hdrs["hysteria-auth"] != "oGXZQkjFHYwgGUxz" {
+		t.Fatalf("decoded headers mismatch: %+v", hdrs)
+	}
+}
+
+func TestGuardAuthSuccessNoSelfBan(t *testing.T) {
+	lim := testLimits()
+	lim.BanAfterFailures = 3
+	g := NewGuard(lim)
+	defer g.Close()
+
+	userIP := netip.MustParseAddr("203.0.113.10")
+	attackerIP := netip.MustParseAddr("198.51.100.99")
+
+	// 正常用户完成一次认证后即使偶发多次异常断开也绝不会被封禁
+	g.AuthSuccess(userIP)
+	for i := 0; i < 10; i++ {
+		g.Fail(userIP)
+	}
+	if !g.Acquire(userIP) {
+		t.Fatal("authenticated user IP should never be banned by Guard")
+	}
+	g.Release(userIP)
+
+	// 未认证扫描器连续口令错误达到阈值后被正常封禁
+	for i := 0; i < 3; i++ {
+		g.Fail(attackerIP)
+	}
+	if g.Acquire(attackerIP) {
+		t.Fatal("unauthenticated attacker IP should be banned after 3 failures")
 	}
 }

@@ -207,6 +207,8 @@ net.ipv4.tcp_fastopen = 3
 net.ipv4.tcp_slow_start_after_idle = 0
 net.ipv4.tcp_tw_reuse = 1
 net.ipv4.ip_local_port_range = 10240 65535
+net.core.rmem_default = 2097152
+net.core.wmem_default = 2097152
 net.core.rmem_max = 16777216
 net.core.wmem_max = 16777216
 net.ipv4.tcp_rmem = 4096 131072 16777216
@@ -268,7 +270,7 @@ update_mproxy() {
         git clone --depth=1 https://github.com/player4sir/mproxy.git "$src_dir"
     fi
 
-    (cd "$src_dir" && go build -trimpath -ldflags="-s -w" -o "$BIN_CORE" .)
+    (cd "$src_dir" && go mod tidy && go build -trimpath -ldflags="-s -w" -o "$BIN_CORE" .)
     chmod +x "$BIN_CORE"
     if [[ -f "$src_dir/deploy/mproxy.sh" ]]; then
         cp "$src_dir/deploy/mproxy.sh" /usr/local/bin/mproxy

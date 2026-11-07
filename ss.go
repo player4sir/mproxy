@@ -243,6 +243,7 @@ func (h *ssHandler) handle(ctx context.Context, raw net.Conn) {
 		}
 		return
 	}
+	h.guard.AuthSuccess(ip)
 	dctx, cancel := context.WithTimeout(ctx, h.lim.HandshakeTimeout.Duration)
 	up, err := h.out.Dial(dctx, host, port)
 	cancel()
@@ -300,6 +301,7 @@ func (h *ssHandler) ServeUDP(ctx context.Context, ln *net.UDPConn) {
 			h.guard.Release(clientIP)
 			continue
 		}
+		h.guard.AuthSuccess(clientIP)
 		h.guard.Release(clientIP)
 
 		tHost, tPort, offset, err := parseAddrBytes(plain)
