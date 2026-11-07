@@ -270,7 +270,10 @@ update_mproxy() {
         git clone --depth=1 https://github.com/player4sir/mproxy.git "$src_dir"
     fi
 
-    (cd "$src_dir" && go mod tidy && go build -trimpath -ldflags="-s -w" -o "$BIN_CORE" .)
+    if ! (cd "$src_dir" && rm -f go.sum && go mod tidy && go build -trimpath -ldflags="-s -w" -o "$BIN_CORE" .); then
+        echo -e "${RED}[错误] 编译失败，请检查上方报错信息！${PLAIN}"
+        exit 1
+    fi
     chmod +x "$BIN_CORE"
     if [[ -f "$src_dir/deploy/mproxy.sh" ]]; then
         cp "$src_dir/deploy/mproxy.sh" /usr/local/bin/mproxy
