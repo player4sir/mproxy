@@ -812,7 +812,7 @@ func TestHy2UDPCodecAndQPACKAuth(t *testing.T) {
 
 func TestShadowsocksTCPAndUDP(t *testing.T) {
 	echoTCP := startEchoTCP(t)
-	echoUDP := startEchoUDP(t)
+	_, echoUDP := startEchoUDP(t)
 	lim := testLimits()
 	out := newOut(t)
 	udpMgr := NewUDPManager(out, 5*time.Second)
