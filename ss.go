@@ -12,6 +12,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"math/big"
 	"net"
 	"sync"
@@ -295,7 +296,8 @@ func (h *ssHandler) ServeUDP(ctx context.Context, ln *net.UDPConn) {
 
 		aead := newGCM(h.key, salt)
 		var nonce [12]byte
-		plain, err := aead.Open(buf[:0], nonce[:], buf[keyLen:n], nil)
+		// 严格使用 buf[keyLen:keyLen] (即 ciphertext[:0]) 原地解密，避免与前置 salt 产生非对齐内存重叠导致 Go cipher.AEAD panic
+		plain, err := aead.Open(buf[keyLen:keyLen], nonce[:], buf[keyLen:n], nil)
 		if err != nil {
 			h.guard.Fail(clientIP)
 			h.guard.Release(clientIP)
@@ -308,26 +310,35 @@ func (h *ssHandler) ServeUDP(ctx context.Context, ln *net.UDPConn) {
 		if err != nil {
 			continue
 		}
-		payload := plain[offset:]
+		payload := make([]byte, len(plain[offset:]))
+		copy(payload, plain[offset:])
+		cAddr := *clientAddr
 
-		clientKey := fmt.Sprintf("ss:%s", clientAddr.String())
-		_ = h.udpMgr.SendPacket(clientKey, tHost, tPort, payload, func(respHost string, respPort int, respPayload []byte) error {
-			respAddrHeader, err := writeAddr(nil, respHost, respPort)
-			if err != nil {
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					slog.Error("panic in ss udp handler", "panic", r)
+				}
+			}()
+			clientKey := fmt.Sprintf("ss:%s", cAddr.String())
+			_ = h.udpMgr.SendPacket(clientKey, tHost, tPort, payload, func(respHost string, respPort int, respPayload []byte) error {
+				respAddrHeader, err := writeAddr(nil, respHost, respPort)
+				if err != nil {
+					return err
+				}
+				respPlain := append(respAddrHeader, respPayload...)
+
+				respSalt := make([]byte, keyLen)
+				if _, err := rand.Read(respSalt); err != nil {
+					return err
+				}
+				respAead := newGCM(h.key, respSalt)
+				var respNonce [12]byte
+
+				ciphertext := respAead.Seal(respSalt, respNonce[:], respPlain, nil)
+				_, err = ln.WriteToUDP(ciphertext, &cAddr)
 				return err
-			}
-			respPlain := append(respAddrHeader, respPayload...)
-
-			respSalt := make([]byte, keyLen)
-			if _, err := rand.Read(respSalt); err != nil {
-				return err
-			}
-			respAead := newGCM(h.key, respSalt)
-			var respNonce [12]byte
-
-			ciphertext := respAead.Seal(respSalt, respNonce[:], respPlain, nil)
-			_, err = ln.WriteToUDP(ciphertext, clientAddr)
-			return err
-		})
+			})
+		}()
 	}
 }

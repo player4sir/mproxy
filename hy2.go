@@ -19,8 +19,10 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/quic-go/quic-go"
-	"github.com/quic-go/quic-go/quicvarint"
+	"mproxy/internal/hy2cc"
+
+	"github.com/apernet/quic-go"
+	"github.com/apernet/quic-go/quicvarint"
 )
 
 // Hy2Config Hysteria 2 专属参数配置
@@ -35,6 +37,8 @@ type Hy2Config struct {
 type hy2Handler struct {
 	password   string
 	masquerade string
+	maxTx      uint64
+	maxRx      uint64
 	out        *Outbound
 	guard      *Guard
 	lim        Limits
@@ -44,11 +48,18 @@ type hy2Handler struct {
 func newHy2Handler(lc ListenerConfig, out *Outbound, g *Guard, lim Limits, udpMgr *UDPManager) *hy2Handler {
 	pw := lc.Password
 	masq := ""
+	var maxTx, maxRx uint64
 	if lc.Hy2 != nil {
 		if lc.Hy2.Password != "" {
 			pw = lc.Hy2.Password
 		}
 		masq = lc.Hy2.Masquerade
+		if lc.Hy2.DownMbps > 0 {
+			maxTx = uint64(lc.Hy2.DownMbps) * 125000
+		}
+		if lc.Hy2.UpMbps > 0 {
+			maxRx = uint64(lc.Hy2.UpMbps) * 125000
+		}
 	}
 	if pw == "" && len(lc.Passwords) > 0 {
 		pw = lc.Passwords[0]
@@ -59,6 +70,8 @@ func newHy2Handler(lc ListenerConfig, out *Outbound, g *Guard, lim Limits, udpMg
 	return &hy2Handler{
 		password:   pw,
 		masquerade: masq,
+		maxTx:      maxTx,
+		maxRx:      maxRx,
 		out:        out,
 		guard:      g,
 		lim:        lim,
@@ -264,16 +277,19 @@ func (h *hy2Handler) handleSession(ctx context.Context, sess quic.Connection, cl
 	h.guard.AuthSuccess(clientIP)
 	_ = authStream.SetDeadline(time.Time{})
 
-	// 官方 Hysteria 2 认证成功响应帧 (:status: 233, hysteria-udp: true, hysteria-cc-rx: auto)
-	qpackPayload := []byte{
-		0x00, 0x00, // QPACK Prefix: Required Insert Count = 0, Base = 0
-		0x5f, 0x30, 0x03, '2', '3', '3', // :status = 233
-		0x27, 0x05, 'h', 'y', 's', 't', 'e', 'r', 'i', 'a', '-', 'u', 'd', 'p', 0x04, 't', 'r', 'u', 'e',
-		0x27, 0x07, 'h', 'y', 's', 't', 'e', 'r', 'i', 'a', '-', 'c', 'c', '-', 'r', 'x', 0x04, 'a', 'u', 't', 'o',
+	// 注入官方 Hysteria 2 拥塞控制引擎：客户端指定下行带宽时启用 Brutal 恒定速率抗丢包，未指定时启用 BBR 拥塞控制（取代标准 quic-go 在跨境丢包链路上降窗失速的 Reno/CUBIC）
+	clientRx, _ := strconv.ParseUint(hdrs["hysteria-cc-rx"], 10, 64)
+	actualTx := clientRx
+	if h.maxTx > 0 && actualTx > h.maxTx {
+		actualTx = h.maxTx
 	}
-	respFrame := make([]byte, 0, 2+len(qpackPayload))
-	respFrame = append(respFrame, 0x01, byte(len(qpackPayload)))
-	respFrame = append(respFrame, qpackPayload...)
+	if actualTx > 0 {
+		hy2cc.UseBrutal(sess, actualTx)
+	} else {
+		hy2cc.UseBBR(sess)
+	}
+
+	respFrame := buildHy2AuthResponseFrame(h.udpMgr != nil, h.maxRx)
 	if _, err := authStream.Write(respFrame); err != nil {
 		_ = authStream.Close()
 		return
@@ -293,6 +309,33 @@ func (h *hy2Handler) handleSession(ctx context.Context, sess quic.Connection, cl
 		}
 		go h.handleTCPStream(sessCtx, sess, stream)
 	}
+}
+
+// buildHy2AuthResponseFrame 构造官方 Hysteria 2 认证成功 HTTP/3 HEADERS 帧 (:status=233, hysteria-udp, hysteria-cc-rx)
+func buildHy2AuthResponseFrame(udpEnabled bool, maxRx uint64) []byte {
+	udpVal := "false"
+	if udpEnabled {
+		udpVal = "true"
+	}
+	rxVal := strconv.FormatUint(maxRx, 10)
+
+	qpackPayload := make([]byte, 0, 64)
+	qpackPayload = append(qpackPayload,
+		0x00, 0x00, // QPACK Prefix: Required Insert Count = 0, Base = 0
+		0x5f, 0x30, 0x03, '2', '3', '3', // :status = 233 (Static Table 63 = 15 + 48)
+		0x27, 0x05, 'h', 'y', 's', 't', 'e', 'r', 'i', 'a', '-', 'u', 'd', 'p', byte(len(udpVal)),
+	)
+	qpackPayload = append(qpackPayload, udpVal...)
+	qpackPayload = append(qpackPayload,
+		0x27, 0x07, 'h', 'y', 's', 't', 'e', 'r', 'i', 'a', '-', 'c', 'c', '-', 'r', 'x', byte(len(rxVal)),
+	)
+	qpackPayload = append(qpackPayload, rxVal...)
+
+	frame := make([]byte, 0, 4+len(qpackPayload))
+	frame = append(frame, 0x01) // HTTP/3 Frame Type: HEADERS
+	frame = quicvarint.Append(frame, uint64(len(qpackPayload)))
+	frame = append(frame, qpackPayload...)
+	return frame
 }
 
 // writeH3Masquerade 向主动探测者或普通 HTTP/3 浏览器返回标准的 200 OK HTML 响应帧
@@ -507,6 +550,9 @@ func (h *hy2Handler) handleDatagrams(ctx context.Context, sess quic.Connection) 
 				var tooLarge *quic.DatagramTooLargeError
 				if errors.As(err, &tooLarge) {
 					newMax := 900
+					if tooLarge.MaxDataLen > 64 {
+						newMax = int(tooLarge.MaxDataLen)
+					}
 					maxDgramSize.Store(int32(newMax))
 					retryFrames := encodeHy2UDPFrames(sID, uint16(pktSeq.Add(1)), respAddr, respPayload, newMax)
 					for _, rf := range retryFrames {

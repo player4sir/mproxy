@@ -798,6 +798,96 @@ func TestHy2UDPCodecAndQPACKAuth(t *testing.T) {
 	if hdrs[":method"] != "POST" || hdrs[":path"] != "/auth" || hdrs["hysteria-auth"] != "oGXZQkjFHYwgGUxz" {
 		t.Fatalf("decoded headers mismatch: %+v", hdrs)
 	}
+
+	// 3. 验证服务端 233 认证成功响应帧编解码回环
+	respFrame := buildHy2AuthResponseFrame(true, 0)
+	respHdrs, err := readH3Headers(bufio.NewReader(bytes.NewReader(respFrame)))
+	if err != nil {
+		t.Fatalf("readH3Headers on auth response failed: %v", err)
+	}
+	if respHdrs[":status"] != "233" || respHdrs["hysteria-udp"] != "true" || respHdrs["hysteria-cc-rx"] != "0" {
+		t.Fatalf("auth response headers mismatch: %+v", respHdrs)
+	}
+}
+
+func TestShadowsocksTCPAndUDP(t *testing.T) {
+	echoTCP := startEchoTCP(t)
+	echoUDP := startEchoUDP(t)
+	lim := testLimits()
+	out := newOut(t)
+	udpMgr := NewUDPManager(out, 5*time.Second)
+	t.Cleanup(func() { udpMgr.Close() })
+
+	lc := ListenerConfig{
+		Type:     "shadowsocks",
+		Method:   "aes-256-gcm",
+		Password: "test-ss-password-2026",
+	}
+	sh := newSSHandler(lc, out, NewGuard(lim), lim, udpMgr)
+	srv := startServer(t, sh.handle, lim)
+
+	// 1. Shadowsocks TCP AEAD
+	rawTCP, err := net.Dial("tcp", srv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rawTCP.Close()
+	clientSS := newSSConn(rawTCP, sh.key, newReplayFilter(1024))
+	if _, err := clientSS.Write(addrBytes(t, echoTCP)); err != nil {
+		t.Fatal(err)
+	}
+	expectEcho(t, clientSS, "hello shadowsocks aead tcp")
+
+	// 2. Shadowsocks UDP AEAD (验证无内存重叠 panic 且双向加解密正常)
+	uLn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 0})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(func() {
+		cancel()
+		_ = uLn.Close()
+	})
+	go sh.ServeUDP(ctx, uLn)
+
+	clientUDP, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 0})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer clientUDP.Close()
+
+	salt := make([]byte, len(sh.key))
+	_, _ = rand.Read(salt)
+	aead := newGCM(sh.key, salt)
+	var nonce [12]byte
+	msg := []byte("hello shadowsocks aead udp")
+	plain := append(addrBytes(t, echoUDP), msg...)
+	pkt := aead.Seal(salt, nonce[:], plain, nil)
+
+	if _, err := clientUDP.WriteToUDP(pkt, uLn.LocalAddr().(*net.UDPAddr)); err != nil {
+		t.Fatal(err)
+	}
+
+	rbuf := make([]byte, 2048)
+	_ = clientUDP.SetReadDeadline(time.Now().Add(2 * time.Second))
+	n, _, err := clientUDP.ReadFromUDP(rbuf)
+	if err != nil {
+		t.Fatalf("ss udp recv failed: %v", err)
+	}
+	respSalt := rbuf[:len(sh.key)]
+	respAead := newGCM(sh.key, respSalt)
+	var respNonce [12]byte
+	dec, err := respAead.Open(nil, respNonce[:], rbuf[len(sh.key):n], nil)
+	if err != nil {
+		t.Fatalf("ss udp decrypt failed: %v", err)
+	}
+	_, _, off, err := parseAddrBytes(dec)
+	if err != nil {
+		t.Fatalf("ss udp parseAddrBytes failed: %v", err)
+	}
+	if string(dec[off:]) != string(msg) {
+		t.Fatalf("ss udp payload mismatch: got %q, want %q", dec[off:], msg)
+	}
 }
 
 func TestGuardAuthSuccessNoSelfBan(t *testing.T) {
